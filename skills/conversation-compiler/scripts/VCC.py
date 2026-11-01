@@ -379,8 +379,10 @@ CODEX = Profile(
 # reads): {"type": "user"|"assistant"|"system", "timestamp", "cwd"?,
 #          "message": {"id"?, "content": str | [blocks], "usage"?, "model"?}}
 # with blocks text / thinking / tool_use{id,name,input} / tool_result{tool_use_id,
-# content, is_error} / image / document, plus {"type":"system","subtype":
+# content, is_error, agent_id?} / image / document, plus {"type":"system","subtype":
 # "compact_boundary"} and {"type":"user","isCompactSummary":true} for compaction.
+# Subagents: a tool_result may carry "agent_id" (the subagent it spawned), and the
+# records of a subagent's own log carry a top-level "agentId"; the graph links the two.
 # The "chat" adapter accepts plain role/content JSONL, so any harness can be
 # supported by exporting to it.
 
@@ -663,15 +665,35 @@ def adapt_gemini(recs):
                 status = tc.get("status")
                 if body is None and status not in ("error", "cancelled"):
                     continue
-                results.append({"type": "tool_result", "tool_use_id": tc.get("id", ""),
-                                "content": body or f"[{status}]",
-                                "is_error": status in ("error", "cancelled")})
+                tr = {"type": "tool_result", "tool_use_id": tc.get("id", ""),
+                      "content": body or f"[{status}]",
+                      "is_error": status in ("error", "cancelled")}
+                if isinstance(tc.get("agentId"), str):
+                    tr["agent_id"] = tc["agentId"]
+                results.append(tr)
             if results:
                 out.append({"timestamp": ts, **({"cwd": cwd} if cwd else {}),
                             "type": "user", "message": {"content": results}})
         elif typ in ("info", "error", "warning") and text:
             out.append({**base, "type": "system", "content": f"[{typ}] {text}"})
+    if meta.get("kind") == "subagent" and isinstance(meta.get("sessionId"), str):
+        for r in out:
+            r["agentId"] = meta["sessionId"]
     return out
+
+def adapt_claude(recs):
+    """Claude Code logs already use the internal model; only the subagent link moves:
+    toolUseResult.agentId (record level) -> agent_id on the tool_result block."""
+    for r in recs:
+        tur = r.get("toolUseResult") if isinstance(r, dict) else None
+        if not (isinstance(tur, dict) and isinstance(tur.get("agentId"), str)):
+            continue
+        content = (r.get("message") or {}).get("content")
+        trs = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"] \
+            if isinstance(content, list) else []
+        if len(trs) == 1:
+            trs[0]["agent_id"] = tur["agentId"]
+    return recs
 
 _CODEX_TYPES = {"session_meta", "response_item", "event_msg", "turn_context", "compacted"}
 
@@ -816,7 +838,7 @@ def adapt_codex(recs):
     return out
 
 ADAPTERS = {
-    "claude-code": (lambda recs: recs, CLAUDE_CODE),
+    "claude-code": (adapt_claude, CLAUDE_CODE),
     "codex": (adapt_codex, CODEX),
     "gemini-cli": (adapt_gemini, GEMINI_CLI),
     "chat": (adapt_chat, GENERIC),
@@ -1119,7 +1141,8 @@ def parse(chain, outdir, data_prefix, data_ctr, profile=None):
                                     data_ctr[0] += 1
                                     parts.append(f"[document: {fn}]")
                     ir.append(_node(btype, _sanitize("\n\n".join(parts)).split("\n"),
-                                     searchable=True, _sec=sec, _blk=blk))
+                                     searchable=True, _sec=sec, _blk=blk,
+                                     _agent_id=tr.get("agent_id")))
                     blk += 1; sec += 1
 
         elif rt == "assistant":
@@ -1614,7 +1637,7 @@ def build_turns(ir):
             first = first[:77] + "..."
         return {"num": num, "sec": sec, "ts": hdr.get("_ts") if hdr else None,
                 "text": first, "start": None, "end": None,
-                "tools": OrderedDict(), "errors": [], "files": OrderedDict()}
+                "tools": OrderedDict(), "errors": [], "files": OrderedDict(), "agents": []}
 
     # Turn boundaries (by section id): turn k spans [turn_secs[k], turn_secs[k+1]).
     turns = [_new(i + 1, s) for i, s in enumerate(turn_secs)]
@@ -1639,6 +1662,8 @@ def build_turns(ir):
     errs = _tool_errors(ir)
     blk_range = _blk_ranges(ir)
     for o in ir:
+        if o.get("_agent_id") and o.get("_sec") is not None and o.get("start_line") is not None:
+            _turn_for(o["_sec"])["agents"].append((o["_agent_id"], o["start_line"]))
         name = o.get("_tool_name")
         if not name or o.get("_sec") is None:
             continue
@@ -1653,7 +1678,7 @@ def build_turns(ir):
         for path, mod in o.get("_tool_files") or ():
             t["files"].setdefault(path, []).append(
                 (name, err, _call_ref(o, blk_range, tid_ranges), mod))
-    if pre["tools"] or pre["errors"]:
+    if pre["tools"] or pre["errors"] or pre["agents"]:
         turns.insert(0, pre)
     return turns
 
@@ -1671,7 +1696,35 @@ def _ops_str(ops):
             runs.append([key, 1])
     return ", ".join(k + (f" x{c}" if c > 1 else "") for k, c in runs)
 
-def lower_graph(ir, filename="", cwd=None, turns=None):
+_LOG_EXTS = (".jsonl", ".json", ".jsonl.zst")
+_log_index_cache = {}
+
+def find_agent_logs(base_dir, agent_ids, max_depth=3):
+    """Map agent id -> log file path, for logs under base_dir whose file name contains the id.
+
+    Harness-neutral: Claude Code (<session>/subagents/agent-<id>.jsonl) and Gemini CLI
+    (chats/<parent>/<id>.jsonl) both name subagent logs after the agent id.
+    """
+    if not agent_ids:
+        return {}
+    base_dir = os.path.abspath(base_dir)
+    names = _log_index_cache.get(base_dir)
+    if names is None:
+        names = []
+        root_depth = base_dir.rstrip(os.sep).count(os.sep)
+        for dirpath, dirnames, filenames in os.walk(base_dir):
+            if dirpath.count(os.sep) - root_depth >= max_depth:
+                dirnames[:] = []
+            names.extend(os.path.join(dirpath, f) for f in filenames if f.endswith(_LOG_EXTS))
+        _log_index_cache[base_dir] = names
+    out = {}
+    for aid in agent_ids:
+        hits = [p for p in names if aid in os.path.basename(p)]
+        if hits:
+            out[aid] = min(hits, key=len)
+    return out
+
+def lower_graph(ir, filename="", cwd=None, turns=None, agent_id=None, agent_logs=None):
     """Graph view: user turns linked to the files they touched and to earlier turns.
 
     Nodes are turns (T) and files (F). Edges: turn -> file (with the operations),
@@ -1698,6 +1751,10 @@ def lower_graph(ir, filename="", cwd=None, turns=None):
                 n + (f" x{c}" if c > 1 else "") for n, c in t["tools"].items()))
         if t["errors"]:
             body.append("  errors: " + ", ".join(f"{n} ({short}:{r})" for n, r in t["errors"]))
+        for aid, line in t["agents"]:
+            log = (agent_logs or {}).get(aid)
+            body.append(f"  subagent {aid} (result {short}:{line + 1})"
+                        + (f" -> {_rel_path(log)}" if log else ""))
         for path, ops in t["files"].items():
             st = _file_status(ops)
             if st == "M":
@@ -1708,13 +1765,20 @@ def lower_graph(ir, filename="", cwd=None, turns=None):
             last_turn_on[path] = t["num"]
             file_turns.setdefault(path, []).append((t["num"], ops))
 
+    nagents = sum(len(t["agents"]) for t in turns)
     head = [f"[graph] {sum(1 for t in turns if t['num'])} turn(s), {len(file_turns)} file(s) "
-            f"({len(nfiles_mod)} modified), {nerr} tool error(s). Pointers into {short}."]
+            f"({len(nfiles_mod)} modified), {nerr} tool error(s)"
+            + (f", {nagents} subagent(s)" if nagents else "") + f". Pointers into {short}."]
+    if agent_id:
+        head.append(f"This log is subagent {agent_id}.")
     if cwd:
         head.append(f"cwd: {cwd}")
     head.append("T = user turn (its message and the work it triggered). M/R = modified/read in that turn.")
     head.append("[prev Tn] = the last earlier turn that touched the same file. "
                 "File changes made by shell commands are not tracked.")
+    if nagents:
+        head.append("subagent <id> -> <log> = a subagent this turn started, and its own log "
+                    "(compile it with VCC to read it).")
     tail = []
     if file_turns:
         tail = ["", "[files -> turns]"]
@@ -1726,13 +1790,13 @@ def lower_graph(ir, filename="", cwd=None, turns=None):
 def graph_index(entries):
     """Cross-conversation file index: for each file, every turn in every conversation.
 
-    entries: list of (full_view_path, cwd, turns). Newest activity first.
+    entries: list of (full_view_path, cwd, turns[, agent_id]). Newest activity first.
     """
-    cwds = {c for _, c, _ in entries if c}
+    cwds = {e[1] for e in entries if e[1]}
     common = cwds.pop() if len(cwds) == 1 else None
     by_file = {}
-    for fp, cwd, turns in entries:
-        short = _rel_path(fp)
+    for fp, cwd, turns, *rest in entries:
+        short = _rel_path(fp) + (f" (subagent {rest[0]})" if rest and rest[0] else "")
         for t in turns:
             for path, ops in t["files"].items():
                 by_file.setdefault(path, []).append((t["ts"] or "", short, t, ops))
@@ -2037,10 +2101,14 @@ def compile_pass(input_path, output_dir=None, truncate=128, truncate_user=256,
             os.remove(filesp)  # stale view from an earlier compile
 
         turns = None
+        agent_id = next((r["agentId"] for r in chain if isinstance(r.get("agentId"), str)), None)
         if graph:
             turns = build_turns(ir)
+            spawned = [a for t in turns for a, _ in t["agents"]]
+            logs = find_agent_logs(os.path.dirname(os.path.abspath(input_path)), spawned)
             with open(graphp, "w", encoding="utf-8") as f:
-                f.write("\n".join(lower_graph(ir, ffn, cwd, turns) or ["[graph] empty"]))
+                f.write("\n".join(lower_graph(ir, ffn, cwd, turns, agent_id, logs)
+                                  or ["[graph] empty"]))
 
         if grep_pattern:
             lower_view(ir, ffn, grep_pattern, keep)
@@ -2049,7 +2117,7 @@ def compile_pass(input_path, output_dir=None, truncate=128, truncate_user=256,
 
         ft, bt = "\n".join(full), "\n".join(brief)
         _cnt = lambda s: sum(1 for t in _tokenize(s) if t.strip())
-        results.append((fp, ir, cwd, turns))
+        results.append((fp, ir, cwd, turns, agent_id))
         paths.append((fp, mp, vp if grep_pattern else None,
                        len(full), _cnt(ft), len(brief), _cnt(bt),
                        filesp if files_view else None, graphp if graph else None))
@@ -2131,7 +2199,7 @@ def main():
                       harness=a.harness)
         all_results.extend(res)
     if a.graph and len(all_results) > 1:
-        idx = graph_index([(fp, cwd, turns) for fp, _, cwd, turns in all_results])
+        idx = graph_index([(fp, cwd, turns, aid) for fp, _, cwd, turns, aid in all_results])
         if idx:
             print()
             print("\n".join(idx))

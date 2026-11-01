@@ -141,7 +141,10 @@ T3 2026-04-03 15:30Z (a.txt:52-83) "Rename the dog to Rex"
   tools: Edit, Read
   errors: Bash (a.txt:70-74)
   M src/pets.py: Edit  [prev T1]
+  subagent a04a577a (result a.txt:76) -> a/subagents/agent-a04a577a.jsonl
 ```
+
+A `subagent` line means the turn started a subagent; when its log is found (searched by agent id under the log's directory) the path is shown: compile that file to read what the subagent did.
 
 Use it to answer "which request changed this file, and what earlier turn touched it" (`[prev Tn]`), then jump to the turn's line range in `.txt`. With several JSONL files (`*.jsonl --graph`), stdout also lists, for each file, every turn in every conversation that touched it, newest first: use it to find "where else did we work on X".
 

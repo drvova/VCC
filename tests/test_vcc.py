@@ -287,6 +287,34 @@ class TestGraph(VCCTestCase):
         self.assertIn("session.txt", block[1])
         self.assertTrue(os.path.exists(os.path.join(self.dir, "other.graph.txt")))
 
+    def test_subagent_links(self):
+        # Claude Code layout: the parent's tool result carries toolUseResult.agentId and
+        # the subagent's log lives in <session>/subagents/agent-<id>.jsonl
+        recs = _records()[:5] + [
+            {"type": "assistant", "timestamp": "2026-04-01T09:01:00Z",
+             "message": {"id": "m9", "content": [{"type": "tool_use", "id": "toolu_0000000agent",
+                                                  "name": "Agent", "input": {"description": "Audit pets",
+                                                                             "prompt": "..."}}]}},
+            {"type": "user", "timestamp": "2026-04-01T09:02:00Z",
+             "toolUseResult": {"agentId": "abc123def", "status": "completed"},
+             "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_0000000agent",
+                                      "content": "Audit done."}]}}]
+        _write_jsonl(self.jsonl, recs)
+        sub_dir = os.path.join(self.dir, "session", "subagents")
+        os.makedirs(sub_dir)
+        sub = os.path.join(sub_dir, "agent-abc123def.jsonl")
+        _write_jsonl(sub, [{"type": "user", "agentId": "abc123def", "isSidechain": True,
+                            "timestamp": "2026-04-01T09:01:01Z",
+                            "message": {"content": "Audit pets"}}])
+        self.compile(graph=True)
+        graph = "\n".join(self.read("session.graph.txt"))
+        self.assertIn("1 subagent(s)", graph)
+        self.assertRegex(graph, r"  subagent abc123def \(result session\.txt:\d+\) -> "
+                                r".*session/subagents/agent-abc123def\.jsonl")
+        VCC.compile_pass(sub, quiet=True, graph=True)
+        with open(os.path.join(sub_dir, "agent-abc123def.graph.txt")) as f:
+            self.assertIn("This log is subagent abc123def.", f.read())
+
     def test_no_graph_by_default(self):
         self.compile()
         self.assertFalse(os.path.exists(os.path.join(self.dir, "session.graph.txt")))
@@ -440,6 +468,20 @@ class TestGeminiAdapter(VCCTestCase):
         self.assertIn("R /p/config.toml", files)                     # the edit failed
         graph = "\n".join(self.read(stem + ".graph.txt"))
         self.assertIn("errors: replace", graph)
+
+    def test_subagent_ids(self):
+        recs = [dict(r) for r in self.recs]
+        recs[4] = dict(recs[4], toolCalls=[dict(recs[4]["toolCalls"][0], agentId="sub-9")]
+                      + recs[4]["toolCalls"][1:])
+        out = VCC.adapt_gemini(recs)
+        results = [b for r in out for b in (r["message"]["content"] if isinstance(
+            r.get("message", {}).get("content"), list) else []) if b.get("type") == "tool_result"]
+        self.assertEqual(results[0].get("agent_id"), "sub-9")
+        child = VCC.adapt_gemini([{"sessionId": "sub-9", "projectHash": "h", "kind": "subagent",
+                                   "startTime": "x", "lastUpdated": "x"},
+                                  {"id": "a", "timestamp": "2026-06-01T10:00:00Z", "type": "user",
+                                   "content": "task"}])
+        self.assertEqual(child[0]["agentId"], "sub-9")
 
     def test_legacy_single_json(self):
         legacy = os.path.join(self.dir, "session-old.json")
