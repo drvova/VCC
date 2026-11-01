@@ -247,6 +247,16 @@ Same matches, but as a flat list. Each entry is taged with what it is (user mess
 
 The adaptive view keeps conversation order so it is good for understanding context around a match. The transposed view is a flat list so it is good for scanning all matches at once. All pointers points into the full view.
 
+## Additions in this fork
+
+* **Timestamps**: `[user]` headers and every `--grep` hit show the UTC time (`[user] 2026-04-02 10:31Z`).
+* **Search filters**: `--role tool_error`, `--since 2026-04-01`, `--until 2026-04-30`, `--limit 30`. They apply to both the stdout hits and `.view.txt`. `--grep . --role tool_error` lists every failed tool call.
+* **Files view** (`.files.txt`): every file the conversation read or modified, newest first, with `(call, result)` pointers into the full view. `/recall` uses it as the checklist of files to re-read.
+* **Optional hook** (`vcc_hook.py`): compiles views when compaction starts, and/or archives logs so they survive Claude Code's 30-day `cleanupPeriodDays` deletion. See INSTALL.md.
+* **Tests**: `python -m unittest discover tests`.
+
+All of it is deterministic and computed from the JSONL (no LLM calls, no stored summaries). Line numbers are unchanged: timestamps are appended to existing header lines.
+
 # Q&A
 
 ### "Just another agent memory system?"

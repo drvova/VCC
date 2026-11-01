@@ -4,6 +4,7 @@
 Produces per conversation chain:
   .txt       Full transcript (lossless rendering of JSONL)
   .min.txt   Brief mode (tool_call summaries with line refs, no separators)
+  .files.txt Files view (files touched by Read/Write/Edit, with line refs; if any)
   .view.txt  View mode (search-focused, only with --grep)
 
 Usage:
@@ -13,6 +14,8 @@ Usage:
   python VCC.py conversation.jsonl -tu 256      # user message truncation limit (default 256)
   python VCC.py conversation.jsonl -o outdir    # output directory
   python VCC.py project/*.jsonl --grep "kw"     # multi-file search
+  python VCC.py *.jsonl --grep "kw" --since 2026-04-01 --role user,assistant --limit 20
+  python VCC.py s.jsonl --grep . --role tool_error  # every failed tool call
 """
 
 import argparse
@@ -117,6 +120,35 @@ def _short(fn):
 
 def _short_tid(tid):
     return tid[-6:] if len(tid) > 6 else tid
+
+# ── timestamps ──
+
+def _parse_ts(s):
+    """Parse an ISO-8601 timestamp (JSONL style, e.g. 2026-04-02T10:31:05.123Z) to aware UTC."""
+    from datetime import datetime, timezone
+    if not s or not isinstance(s, str):
+        return None
+    try:
+        d = datetime.fromisoformat(s.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return d.astimezone(timezone.utc)
+
+def _fmt_ts(s):
+    d = _parse_ts(s)
+    return d.strftime("%Y-%m-%d %H:%MZ") if d else None
+
+def _parse_when(s, end=False):
+    """Parse a --since/--until value. A bare date (YYYY-MM-DD) as --until covers that whole day."""
+    from datetime import timedelta
+    d = _parse_ts(s)
+    if d is None:
+        raise ValueError(f"cannot parse time {s!r} (use YYYY-MM-DD or ISO-8601)")
+    if end and len(s.strip()) == 10:
+        d += timedelta(days=1)
+    return d
 
 def lex(path):
     with open(path, encoding="utf-8") as f:
@@ -308,6 +340,9 @@ _TOOL_SUMMARY_FIELDS = {
     "Glob": "pattern", "Grep": "pattern",
     "Agent": "description", "Skill": "skill",
 }
+# Tools whose input names a file; used by the files view.
+_FILE_TOOLS = {"Read", "Write", "Edit", "MultiEdit", "NotebookEdit"}
+_FILE_WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 
 def _tool_summary(name, inp):
     """Build one-line summary: * Name "param" """
@@ -388,8 +423,12 @@ def parse(chain, outdir, data_prefix, data_ctr):
                 inp = b.get("input", {})
                 hl = f">>>tool_call {name}:{_short_tid(tid)}"
                 summary = _tool_summary(name, inp)
+                fpath = None
+                if name in _FILE_TOOLS and isinstance(inp, dict):
+                    fpath = inp.get("file_path") or inp.get("notebook_path")
                 ir.append(_node("meta", [hl], _sec=sec, _blk=blk,
-                                 _tool_summary=summary))
+                                 _tool_summary=summary, _tool_name=name,
+                                 _tool_tid=_short_tid(tid), _tool_file=fpath))
                 if inp:
                     ir.append(_node("tool_call", _emit_dict(inp).split("\n"),
                                      searchable=True, _sec=sec, _blk=blk))
@@ -417,7 +456,17 @@ def parse(chain, outdir, data_prefix, data_ctr):
                 blk += 1; has_any = True
         return has_any
 
+    def _user_header(r):
+        ts = _fmt_ts(r.get("timestamp"))
+        return f"[user] {ts}" if ts else "[user]"
+
+    # Every IR node is stamped with the timestamp of the record it came from
+    # (used for --since/--until and for dating search hits).
+    stamp_from, cur_ts = 0, None
     for r in chain:
+        for o in ir[stamp_from:]:
+            o.setdefault("_ts", cur_ts)
+        stamp_from, cur_ts = len(ir), r.get("timestamp")
         rt = r.get("type")
 
         if rt == "system":
@@ -437,7 +486,7 @@ def parse(chain, outdir, data_prefix, data_ctr):
             if r.get("isCompactSummary"):
                 content = r.get("message", {}).get("content", "")
                 nlines = content.count("\n") + 1 if content else 0
-                _emit_sep(); _emit_header("[user]")
+                _emit_sep(); _emit_header(_user_header(r))
                 ir.append(_node("user", [f"[compact summary — {nlines} lines]"], searchable=False,
                                  _sec=sec, _blk=blk))
                 blk += 1; sec += 1
@@ -445,7 +494,7 @@ def parse(chain, outdir, data_prefix, data_ctr):
             content = r.get("message", {}).get("content", "")
             if isinstance(content, str):
                 if content:
-                    _emit_sep(); _emit_header("[user]")
+                    _emit_sep(); _emit_header(_user_header(r))
                     ir.append(_node("user", _sanitize(content).split("\n"), searchable=True,
                                      _sec=sec, _blk=blk))
                     blk += 1; sec += 1
@@ -456,7 +505,7 @@ def parse(chain, outdir, data_prefix, data_ctr):
                     mark = len(ir)
                     saved_data = data_ctr[0]
                     saved_blk = blk
-                    _emit_sep(); _emit_header("[user]")
+                    _emit_sep(); _emit_header(_user_header(r))
                     if _emit_blocks(tblocks, "user"):
                         sec += 1
                     else:
@@ -509,6 +558,8 @@ def parse(chain, outdir, data_prefix, data_ctr):
                 _emit_blocks(blocks, "assistant")
                 sec += 1
 
+    for o in ir[stamp_from:]:
+        o.setdefault("_ts", cur_ts)
     ir.append(_node("meta", [""]))  # trailing newline
     return ir
 
@@ -610,9 +661,19 @@ def _strip_noise_xml(text):
     text = _BRIEF_UNWRAP_RE.sub('', text)
     return text.strip()
 
-def _user_hidden_in_brief(ir, sec):
+def _searchable_by_sec(ir):
+    """Map sec -> its searchable nodes, in IR order (built once per lowering)."""
+    idx = {}
+    for o in ir:
+        if o.get("searchable") and o.get("_sec") is not None:
+            idx.setdefault(o["_sec"], []).append(o)
+    return idx
+
+def _user_hidden_in_brief(ir, sec, by_sec=None):
     """Check if a user section should be entirely hidden in brief mode."""
-    blocks = [o for o in ir if o.get("_sec") == sec and o.get("searchable")]
+    if by_sec is None:
+        by_sec = _searchable_by_sec(ir)
+    blocks = by_sec.get(sec, [])
     if not blocks:
         return False
     for o in blocks:
@@ -628,10 +689,12 @@ def _user_hidden_in_brief(ir, sec):
         return False
     return True
 
-def _section_hidden_exact(ir, sec):
+def _section_hidden_exact(ir, sec, by_sec=None):
     """Check if all searchable content in a section is an exact-match hide string."""
-    blocks = [o for o in ir if o.get("_sec") == sec and o.get("searchable")
-              and o["type"] not in ("thinking", "redacted_thinking")]
+    if by_sec is None:
+        by_sec = _searchable_by_sec(ir)
+    blocks = [o for o in by_sec.get(sec, [])
+              if o["type"] not in ("thinking", "redacted_thinking")]
     if not blocks:
         return False
     for o in blocks:
@@ -714,12 +777,13 @@ def lower_brief(ir, truncate, filename="", truncate_user=256):
 
     # Sections that are all-thinking should still be hidden in truncation
     # (they have no visible content after thinking is removed)
+    by_sec = _searchable_by_sec(ir)
     for sec in list(visible_secs):
         if sec not in sec_has_nonthink:
             visible_secs.discard(sec)
-        elif roles.get(sec) == "user" and _user_hidden_in_brief(ir, sec):
+        elif roles.get(sec) == "user" and _user_hidden_in_brief(ir, sec, by_sec):
             visible_secs.discard(sec)
-        elif _section_hidden_exact(ir, sec):
+        elif _section_hidden_exact(ir, sec, by_sec):
             visible_secs.discard(sec)
 
     # Recompute merge_secs after possible visibility changes
@@ -846,9 +910,75 @@ def lower_brief(ir, truncate, filename="", truncate_user=256):
         o["content_brief"] = list(o["content"])
 
 
+# ── lowering: files ──
+
+def lower_files(ir, filename="", cwd=None):
+    """Files view: every file touched by a file tool, with pointers into the full view.
+
+    Deterministic (no LLM). Lists, per file, each Read/Write/Edit call with its
+    (call, result) line ranges, newest-touched file first, and marks files that a
+    successful write tool modified. Returns a list of lines, or None if no file was touched.
+    """
+    short = _short(filename)
+    tid_ranges = _tid_result_ranges(ir)
+    err_tids = set()
+    for o in ir:
+        if o["type"] == "meta_header" and o["content"] and o["content"][0].startswith("[tool_error]"):
+            err_tids.add(o["content"][0].split(":")[-1])
+    blk_range = {}
+    for o in ir:
+        b, sl, el = o.get("_blk"), o.get("start_line"), o.get("end_line")
+        if b is None or sl is None or el is None:
+            continue
+        r = blk_range.get(b)
+        blk_range[b] = (sl, el) if r is None else (min(r[0], sl), max(r[1], el))
+
+    files = {}   # path -> {"ops": [...], "last": idx, "modified": bool}
+    for idx, o in enumerate(ir):
+        path = o.get("_tool_file")
+        if not path:
+            continue
+        name, tid = o.get("_tool_name", "?"), o.get("_tool_tid", "")
+        rng = blk_range.get(o.get("_blk"))
+        ref = f"{rng[0]+1}-{rng[1]+1}" if rng else "?"
+        rr = tid_ranges.get(tid)
+        if rr:
+            ref += f",{rr[0]+1}-{rr[1]+1}"
+        err = tid in err_tids
+        f = files.setdefault(path, {"ops": [], "last": idx, "last_op": name,
+                                    "last_ts": None, "modified": False})
+        f["ops"].append(f"  {name:<12} ({short}:{ref})" + (" error" if err else ""))
+        f["last"], f["last_op"], f["last_ts"] = idx, name, o.get("_ts")
+        if name in _FILE_WRITE_TOOLS and not err:
+            f["modified"] = True
+    if not files:
+        return None
+
+    def _disp(p):
+        if cwd and p.startswith(cwd.rstrip("/\\") + os.sep):
+            return p[len(cwd.rstrip("/\\")) + 1:]
+        return p
+
+    nmod = sum(1 for f in files.values() if f["modified"])
+    out = [f"[files] {len(files)} file(s) touched, {nmod} modified "
+           f"(M = modified by a write tool here, R = read only)"]
+    if cwd:
+        out.append(f"cwd: {cwd}")
+    out.append(f"Pointers are (call, result) line ranges in {short}. Newest-touched first.")
+    out.append("Changes made via Bash or outside this session are NOT tracked: re-read files before relying on them.")
+    for path, f in sorted(files.items(), key=lambda kv: -kv[1]["last"]):
+        ts = _fmt_ts(f["last_ts"])
+        out.append("")
+        out.append(f"{'M' if f['modified'] else 'R'} {_disp(path)}  "
+                   f"(last: {f['last_op']}" + (f" {ts}" if ts else "") + ")")
+        out.extend(f["ops"])
+    out.append("")
+    return out
+
+
 # ── lowering: view ──
 
-def lower_view(ir, filename="", grep_pattern=None):
+def lower_view(ir, filename="", grep_pattern=None, keep=None):
     if not grep_pattern:
         # No grep: view is same as truncated (shouldn't normally be called)
         for o in ir:
@@ -860,6 +990,8 @@ def lower_view(ir, filename="", grep_pattern=None):
     # Per-node match check
     def _node_matches(o):
         if not o["searchable"]:
+            return False
+        if keep is not None and not keep(o):
             return False
         for line in o["content"]:
             if grep_pattern.search(line):
@@ -960,26 +1092,63 @@ def _rel_path(fp):
     except ValueError:
         return os.path.abspath(fp)
 
-def grep_search(results, pattern):
+def make_block_filter(roles=None, since=None, until=None):
+    """Return keep(o) -> bool for --role/--since/--until, or None when no filter is set.
+
+    A role matches a block type exactly or as a prefix: `tool` matches tool_call,
+    tool_result and tool_error; `user` also matches user_image / user_document.
+    With a time bound, blocks without a timestamp are excluded.
+    """
+    if not roles and since is None and until is None:
+        return None
+    roles = tuple(roles or ())
+
+    def keep(o):
+        t = o["type"]
+        if roles and not any(t == r or t.startswith(r + "_") for r in roles):
+            return False
+        if since is not None or until is not None:
+            d = _parse_ts(o.get("_ts"))
+            if d is None:
+                return False
+            if since is not None and d < since:
+                return False
+            if until is not None and d >= until:
+                return False
+        return True
+    return keep
+
+def grep_search(results, pattern, keep=None, limit=0):
+    """Print matching blocks newest-first. limit>0 caps the number of blocks printed."""
     first = True
+    shown = hidden = 0
     for filepath, ir in reversed(results):
         short = _rel_path(filepath)
         for o in reversed(ir):
             if not o["searchable"]: continue
+            if keep is not None and not keep(o): continue
             lines = match_lines(o["content"], pattern, short, o.get("start_line", 0) + 1)
             if len(lines) <= 1:
                 continue
+            if limit and shown >= limit:
+                hidden += 1
+                continue
+            shown += 1
             if not first: print()
             first = False
-            print(f"{lines[0]} [{o['type']}]")
+            ts = _fmt_ts(o.get("_ts"))
+            print(f"{lines[0]} [{o['type']}]" + (f" {ts}" if ts else ""))
             for lt in lines[1:]:
                 print(lt)
+    if hidden:
+        print(f"\n... {hidden} older matching block(s) not shown (--limit {limit}); "
+              f"narrow with --since/--until/--role or raise --limit")
 
 
 # ── compile ──
 
 def compile_pass(input_path, output_dir=None, truncate=128, truncate_user=256,
-            grep_pattern=None, quiet=False):
+            grep_pattern=None, quiet=False, keep=None):
     if output_dir is None:
         output_dir = os.path.dirname(os.path.abspath(input_path)) or "."
     os.makedirs(output_dir, exist_ok=True)
@@ -999,9 +1168,11 @@ def compile_pass(input_path, output_dir=None, truncate=128, truncate_user=256,
         ffn = f"{base}{sfx}.txt"
         mfn = f"{base}{sfx}.min.txt"
         vfn = f"{base}{sfx}.view.txt"
+        filesfn = f"{base}{sfx}.files.txt"
         fp = os.path.join(output_dir, ffn)
         mp = os.path.join(output_dir, mfn)
         vp = os.path.join(output_dir, vfn)
+        filesp = os.path.join(output_dir, filesfn)
         data_ctr = [0]
 
         ir = parse(chain, output_dir, f"{base}{sfx}", data_ctr)
@@ -1018,8 +1189,15 @@ def compile_pass(input_path, output_dir=None, truncate=128, truncate_user=256,
         with open(fp, "w", encoding="utf-8") as f: f.write("\n".join(full))
         with open(mp, "w", encoding="utf-8") as f: f.write("\n".join(brief))
 
+        cwd = next((r["cwd"] for r in chain if isinstance(r.get("cwd"), str)), None)
+        files_view = lower_files(ir, ffn, cwd)
+        if files_view:
+            with open(filesp, "w", encoding="utf-8") as f: f.write("\n".join(files_view))
+        elif os.path.exists(filesp):
+            os.remove(filesp)  # stale view from an earlier compile
+
         if grep_pattern:
-            lower_view(ir, ffn, grep_pattern)
+            lower_view(ir, ffn, grep_pattern, keep)
             view = emit(ir, "content_view")
             with open(vp, "w", encoding="utf-8") as f: f.write("\n".join(view))
 
@@ -1027,15 +1205,19 @@ def compile_pass(input_path, output_dir=None, truncate=128, truncate_user=256,
         _cnt = lambda s: sum(1 for t in _tokenize(s) if t.strip())
         results.append((fp, ir))
         paths.append((fp, mp, vp if grep_pattern else None,
-                       len(full), _cnt(ft), len(brief), _cnt(bt)))
+                       len(full), _cnt(ft), len(brief), _cnt(bt),
+                       filesp if files_view else None))
 
     if not quiet:
-        for fp, _, _, fl, fw, _, _ in paths:
+        for fp, _, _, fl, fw, _, _, _ in paths:
             print(f"  {fp}  ({fl} lines, {fw} words)")
-        for _, mp, _, _, _, bl, bw in paths:
+        for _, mp, _, _, _, bl, bw, _ in paths:
             print(f"  {mp}  ({bl} lines, {bw} words)")
+        for *_, xp in paths:
+            if xp:
+                print(f"  {xp}")
         if grep_pattern:
-            for _, _, vp, _, _, _, _ in paths:
+            for _, _, vp, _, _, _, _, _ in paths:
                 if vp:
                     print(f"  {vp}")
 
@@ -1058,18 +1240,40 @@ def main():
     p.add_argument("-t", "--truncate", nargs="?", type=int, const=128, default=128, metavar="N")
     p.add_argument("-tu", "--truncate-user", nargs="?", type=int, const=256, default=256, metavar="N")
     p.add_argument("--grep", metavar="PATTERN")
+    p.add_argument("--role", metavar="ROLES",
+                   help="with --grep: only search these block types, comma-separated "
+                        "(user, assistant, thinking, tool_call, tool_result, tool_error, system; "
+                        "a prefix like 'tool' matches all tool_* types)")
+    p.add_argument("--since", metavar="WHEN",
+                   help="with --grep: only blocks at/after this UTC time (YYYY-MM-DD or ISO-8601)")
+    p.add_argument("--until", metavar="WHEN",
+                   help="with --grep: only blocks before this UTC time (a bare date includes that day)")
+    p.add_argument("--limit", type=int, default=0, metavar="N",
+                   help="with --grep: print at most N matching blocks, newest first (0 = no limit)")
     a = p.parse_args()
     try:
         a.grep = re.compile(a.grep) if a.grep else None
     except re.error as e:
         p.error(f"invalid regex for --grep: {e}")
+    if (a.role or a.since or a.until or a.limit) and not a.grep:
+        p.error("--role/--since/--until/--limit require --grep (use --grep . to match everything)")
+    try:
+        since = _parse_when(a.since) if a.since else None
+        until = _parse_when(a.until, end=True) if a.until else None
+    except ValueError as e:
+        p.error(str(e))
+    roles = [r.strip() for r in a.role.split(",") if r.strip()] if a.role else None
+    keep = make_block_filter(roles, since, until)
     all_results = []
     for f in _expand_inputs(a.input):
+        # A log last written before --since cannot contain newer blocks: skip compiling it.
+        if since is not None and os.path.exists(f) and os.path.getmtime(f) < since.timestamp():
+            continue
         res = compile_pass(f, a.output_dir, a.truncate, a.truncate_user,
-                      a.grep, quiet=bool(a.grep))
+                      a.grep, quiet=bool(a.grep), keep=keep)
         all_results.extend(res)
     if a.grep:
-        grep_search(all_results, a.grep)
+        grep_search(all_results, a.grep, keep, a.limit)
 
 if __name__ == "__main__":
     if sys.stdout.encoding and sys.stdout.encoding.lower().replace("-", "") != "utf8":

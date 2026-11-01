@@ -12,6 +12,40 @@ Clone this repo to any temporary location. Copy the four folders inside `skills/
 
 Clone this repo to any temporary location. Delete the four folders (`conversation-compiler`, `readchat`, `recall`, `searchchat`) from your `.claude/skills/`, then copy the new versions from the cloned `skills/` into `.claude/skills/`. Delete the cloned repo.
 
+## Keeping your history (recommended)
+
+VCC reads the JSONL logs in `~/.claude/projects/`. By default Claude Code **deletes logs older than 30 days** at startup (`cleanupPeriodDays`, default 30). To search further back, raise it in `~/.claude/settings.json`:
+
+```json
+{ "cleanupPeriodDays": 3650 }
+```
+
+## Optional hooks
+
+`scripts/vcc_hook.py` (inside `conversation-compiler`) can run as a Claude Code hook. It never blocks or fails Claude Code: errors go to stderr and it always exits 0.
+
+- `--compile`: build the views when compaction starts, so they exist on disk right away (for example for other tools). Compilation is fast (about 1s for a 30 MB log) and `/recall` recompiles anyway to include newer messages, so this mainly helps with very large logs.
+- `--archive DIR`: copy the session log (and subagent logs) to `DIR/<project>/`, so it survives cleanup. Run `/searchchat` against the archive directory to search it.
+
+Add to `.claude/settings.json` (project) or `~/.claude/settings.json` (all projects); adjust the script path to where the skill is installed:
+
+```json
+{
+  "hooks": {
+    "PreCompact": [
+      { "hooks": [ { "type": "command",
+        "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/skills/conversation-compiler/scripts/vcc_hook.py\" --compile --archive ~/.claude/vcc-archive" } ] }
+    ],
+    "SessionEnd": [
+      { "hooks": [ { "type": "command",
+        "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/skills/conversation-compiler/scripts/vcc_hook.py\" --archive ~/.claude/vcc-archive" } ] }
+    ]
+  }
+}
+```
+
+Only add these hooks if the user asks for them.
+
 ## Verify
 
 After install or update, ask the user to restart Claude Code, then run `/recall` to test that everything works.

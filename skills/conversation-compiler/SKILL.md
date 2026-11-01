@@ -19,6 +19,9 @@ python "path/to/VCC.py" <input.jsonl ...> [options]
 | `-t <N>` | Token truncation limit (default 128) |
 | `-tu <N>` | User message token limit (default 256) |
 | `--grep <pattern>` | Regex search pattern (Python `re` — use `a|b`, NOT `a\|b`) |
+| `--role <types>` | With `--grep`: only these block types, comma-separated: `user`, `assistant`, `thinking`, `tool_call`, `tool_result`, `tool_error`, `system`. A prefix matches all subtypes (`tool` = all tool blocks) |
+| `--since <when>` / `--until <when>` | With `--grep`: only blocks in this UTC time range. `YYYY-MM-DD` or ISO-8601; a bare `--until` date includes that day |
+| `--limit <N>` | With `--grep`: print at most N matching blocks, newest first, and report how many older ones were left out |
 
 This tool also supports multi-file processing:
 
@@ -32,6 +35,7 @@ cd "/path/to/target/folder" && python "path/to/VCC.py" *.jsonl --grep "keyword"
 |------|------|-------------|
 | `.txt` | Always | Full transcript, lossless |
 | `.min.txt` | Always | Brief overview |
+| `.files.txt` | If any file tool ran | Files touched by Read/Write/Edit/MultiEdit/NotebookEdit, newest first, `M` = modified / `R` = read only, with line refs |
 | `.view.txt` | `--grep` only | Search-focused view |
 | stdout | `--grep` only | Search results with block-level line range references |
 
@@ -80,6 +84,8 @@ Let me take a look.
 
 Each `*` line shows the tool name, key parameter, and two `.txt` line ranges: the call (19-21) and the result (24-34). Read these ranges in `.txt` for full details.
 
+`[user]` headers carry the UTC time of the message (e.g. `[user] 2026-04-02 10:31Z`), so you can tell when things were said.
+
 **3. Search with `--grep`**
 
 Always use `--grep`, never system grep nor your embedded Grep tool. This script's `--grep` returns important block-level line RANGES that no other grep tools can provide. The output paths are relative to CWD, so `cd` close to the target first to keep outputs short and save tokens.
@@ -91,11 +97,18 @@ cd "/path/to/target/folder" && python "path/to/VCC.py" "path/to/conversation.jso
 Stdout example (`#` prefix = shortened filename)：
 
 ```
-(#752a87.txt:L67-L81) [assistant]      →  .txt lines 67-81
-  77: one matched line ...             →  .txt line 77
+(#752a87.txt:L67-L81) [assistant] 2026-04-02 10:31Z   →  .txt lines 67-81, with block time
+  77: one matched line ...                            →  .txt line 77
 ```
 
 Optionally read `.view.txt` for focused search view.
+
+Narrow searches instead of reading floods of hits:
+
+- Time questions ("last week", "in March"): add `--since` / `--until`.
+- Who said it: `--role user` for the user's own words, `--role assistant,thinking` for the agent's.
+- What went wrong: `--grep . --role tool_error` lists every failed tool call.
+- Many results: `--limit 30` shows the newest 30 and tells you how many older ones exist.
 
 **4. Jump to `.txt`**
 
@@ -119,6 +132,8 @@ All line references point to `.txt`. Read the referenced range for full context.
 2. `cd ~/.claude/projects/<project> && python "absolute/path/to/VCC.py" *.jsonl --grep "keyword"` — search top-level conversations first.
 3. If no results: `cd ~/.claude/projects/<project> && python "absolute/path/to/VCC.py" **/*.jsonl --grep "keyword"` — expand to subagents.
 
+Across many conversations, add `--limit 30` to keep output small, and `--since` when the user gives a time frame (logs last modified before `--since` are skipped without compiling, which is much faster). If nothing is found for older conversations, Claude Code may have deleted them: see "Keeping your history" in INSTALL.md.
+
 **Critical**: Always `cd` into the target directory first, then use VCC globs — a single `cd && python VCC.py <glob> --grep` is the correct pattern. Without `cd`, grep output contains full absolute paths instead of short relative paths, wasting tokens. All content search on JSONL must use VCC's `--grep`, never system grep or the embedded Grep tool — VCC's `--grep` returns block-level line ranges with role tags that no other grep can provide.
 
 ## /recall — Recover context from a previous conversation
@@ -132,6 +147,6 @@ All line references point to `.txt`. Read the referenced range for full context.
 2. **Follow VCC Workflow** — Follow the full Workflow above (compile → read `.min.txt` → `--grep` → jump to `.txt`) with the JSONL file found in step 1. The summary is lossy — only the original JSONL is authoritative.
 
 3. **Verify against current state** — After recovering the conversation, cross-check with reality:
-   - **REALLY read files** — Read all files referenced in the conversation with your Read tool. Pre-loaded content from system-reminders or prior conversation turns does NOT count — it may be truncated, stale, or lossy. You must issue a fresh Read call for each file, even if you believe you already have its content. 99.97% of the time, the user has externally modified nearly every file between sessions. If you skip reading and miss their external changes, your failure rate is effectively 100%.
+   - **REALLY read files** — Use `.files.txt` as the checklist: it lists every file the conversation read or modified (`M` first priority). Files changed through Bash are not in it, so also scan `.min.txt` for Bash commands that write files. Read all files referenced in the conversation with your Read tool. Pre-loaded content from system-reminders or prior conversation turns does NOT count — it may be truncated, stale, or lossy. You must issue a fresh Read call for each file, even if you believe you already have its content. 99.97% of the time, the user has externally modified nearly every file between sessions. If you skip reading and miss their external changes, your failure rate is effectively 100%.
    - **Key details** — Identify specific values, paths, configs, and logic mentioned in the conversation. Compare against the actual files to catch drift or errors.
    - **Understand the journey** — Trace the user's intent, decision sequence, and direction changes. Understand not just what was done, but how and why they got there.
