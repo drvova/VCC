@@ -367,6 +367,68 @@ class TestToolSemantics(unittest.TestCase):
                          '* apply_patch "a.py"')
 
 
+class TestShellWrites(unittest.TestCase):
+    """Writes inferred from shell commands: conservative, quote/heredoc-aware."""
+
+    def w(self, cmd, cwd="/w"):
+        return VCC.shell_writes(cmd, cwd)
+
+    def test_redirections_and_tee(self):
+        self.assertEqual(self.w("echo hi > out.txt"), ["/w/out.txt"])
+        self.assertEqual(self.w("echo 'a > b' | tee -a log.txt notes.md"), ["/w/log.txt", "/w/notes.md"])
+        self.assertEqual(self.w("cmd 2>&1 >/dev/null; ls > /dev/null 2> err.log"), ["/w/err.log"])
+        self.assertEqual(self.w('echo "a\nb" > multi.txt'), ["/w/multi.txt"])
+
+    def test_commands(self):
+        self.assertEqual(self.w("cd sub && sed -i 's/a/b/' x.py y.py && cd .. && touch z"),
+                         ["/w/sub/x.py", "/w/sub/y.py", "/w/z"])
+        self.assertEqual(self.w("sed -i.bak -e 's/a/b/' -e 's/c/d/' conf.ini"), ["/w/conf.ini"])
+        self.assertEqual(self.w("git checkout -- a.py && git restore --staged c.py"), ["/w/a.py", "/w/c.py"])
+        self.assertEqual(self.w("cp src/a.py backup/ && dd if=/dev/zero of=disk.img"),
+                         ["/w/backup/a.py", "/w/disk.img"])
+        self.assertEqual(self.w("mv old.py new/"), ["/w/old.py", "/w/new/old.py"])
+
+    def test_reads_and_unknowns_are_ignored(self):
+        self.assertEqual(self.w("sed -n '1,5p' f.txt; grep -r x . | head; cat a.txt"), [])
+        self.assertEqual(self.w("rm -rf $TMP/build *.pyc ~/cache; rm stale.lock"), ["/w/stale.lock"])
+        self.assertEqual(self.w('echo "unbalanced > x'), [])
+        self.assertEqual(self.w("python3 - <<'PY'\nopen('hidden.txt','w')\nPY"), [])
+
+    def test_heredoc_body_is_data(self):
+        self.assertEqual(self.w("cat > new.py <<'EOF'\nprint('x > y')\nrm -rf /\nEOF\nmv new.py src/"),
+                         ["/w/new.py", "/w/src/new.py"])
+
+    def test_unknown_directory_drops_relative_paths(self):
+        # regression: a quoted string spanning lines must not hide the `cd`
+        self.assertEqual(self.w('cd /a && python3 -c "\nimport x\n"; rm b.txt'), ["/a/b.txt"])
+        self.assertEqual(self.w('cd $S/fx; python3 -c "\nprint(1)\n"; rm big.jsonl; rm /abs/x'),
+                         ["/abs/x"])
+        self.assertEqual(self.w("echo x > rel.txt", cwd=None), [])
+
+    def test_argv_lists(self):
+        self.assertEqual(self.w(["bash", "-lc", "cd /repo && echo 1 >> notes.txt"], None),
+                         ["/repo/notes.txt"])
+        self.assertEqual(self.w(["sed", "-i", "s/x/y/", "file with space.txt"]),
+                         ["/w/file with space.txt"])
+
+    def test_marked_as_inferred_in_views(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "s.jsonl")
+            _write_jsonl(p, [
+                {"type": "user", "timestamp": "2026-04-01T09:00:00Z", "cwd": "/proj",
+                 "message": {"content": "bump the version"}},
+                {"type": "assistant", "timestamp": "2026-04-01T09:00:01Z", "cwd": "/proj",
+                 "message": {"id": "a", "content": [{"type": "tool_use", "id": "toolu_00000000sh01",
+                             "name": "Bash", "input": {"command": "sed -i 's/1.0/1.1/' setup.cfg"}}]}}])
+            VCC.compile_pass(p, quiet=True, graph=True)
+            with open(os.path.join(d, "s.files.txt")) as f:
+                files = f.read()
+            self.assertIn("M setup.cfg", files)
+            self.assertIn("  Bash~ ", files)
+            with open(os.path.join(d, "s.graph.txt")) as f:
+                self.assertIn("M setup.cfg: Bash~", f.read())
+
+
 def _write_jsonl(path, records):
     with open(path, "w", encoding="utf-8") as f:
         for r in records:
@@ -646,6 +708,27 @@ class TestHook(VCCTestCase):
         proj = os.path.basename(self.dir)
         self.assertTrue(os.path.exists(os.path.join(arch, proj, "session.jsonl")))
         self.assertTrue(os.path.exists(os.path.join(arch, proj, "session", "subagents", "agent-1.jsonl")))
+
+    def test_sweep_mirrors_logs_only(self):
+        src = os.path.join(self.dir, "codex", "sessions", "2026", "06", "01")
+        os.makedirs(src)
+        for fn in ("rollout-a.jsonl", "rollout-b.jsonl.zst", "notes.txt"):
+            with open(os.path.join(src, fn), "w") as f:
+                f.write("{}\n")
+        arch = os.path.join(self.dir, "arch")
+        root = os.path.join(self.dir, "codex")
+        r = self.run_hook("", "--archive", arch, "--sweep", root)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("2 file(s) archived", r.stderr)
+        copied = sorted(os.path.relpath(os.path.join(dp, f), arch)
+                        for dp, _, fs in os.walk(arch) for f in fs)
+        self.assertEqual(len(copied), 2)
+        self.assertTrue(all(c.endswith(("rollout-a.jsonl", "rollout-b.jsonl.zst")) for c in copied))
+        r = self.run_hook("", "--archive", arch, "--sweep", root)
+        self.assertIn("0 file(s) archived", r.stderr)                 # idempotent
+        r = self.run_hook("", "--archive", os.path.join(root, "a"), "--sweep", root)
+        self.assertIn("must not contain each other", r.stderr)
+        self.assertEqual(r.returncode, 0)
 
     def test_never_fails(self):
         for stdin in ("not json", '{"transcript_path": "/nope.jsonl"}', "{}"):

@@ -938,6 +938,141 @@ def tool_files(name, inp):
             out[p] = out.get(p, False) or modifies
     return list(out.items())
 
+# -- shell commands: writes inferred conservatively (marked "~" in the views) --
+
+_SHELL_KEYS = ("command", "cmd")
+_CWD_KEYS = ("workdir", "working_directory", "cwd", "directory")
+_HEREDOC_RE = re.compile(r"<<(-?)\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
+_SEGMENT_OPS = {";", "&&", "||", "|", "&", "(", ")", "|&", ";;", "\n"}
+_REDIRECT_OPS = {">", ">>", ">|", "&>", "&>>"}
+
+def _strip_heredocs(text):
+    """Drop heredoc bodies (they are data, not commands); join backslash continuations.
+    Returns the remaining lines (quoted strings may still span several of them)."""
+    text = re.sub(r"\\\n", " ", text)
+    out, pending = [], []
+    for line in text.split("\n"):
+        if pending:
+            dash, term = pending[0]
+            if (line.lstrip("\t") if dash else line) == term:
+                pending.pop(0)
+            continue
+        out.append(line)
+        pending.extend((m.group(1), m.group(3)) for m in _HEREDOC_RE.finditer(line))
+    return out
+
+def _literal_path(tok):
+    return bool(tok) and tok != "-" and not any(c in tok for c in "$`*?[]{}~") \
+        and not tok.startswith(("/dev/", "&")) and "\n" not in tok
+
+def shell_writes(command, cwd=None):
+    """Files a shell command (string or argv list) writes, moves, creates or deletes.
+
+    Conservative by design: only literal paths in well-known forms (redirections, tee,
+    sed -i, rm, mv, cp, touch, dd of=, git checkout/restore/rm/mv); anything with
+    variables, globs or command substitution is skipped. Returns absolute paths when
+    the working directory is known.
+    """
+    import shlex
+    if isinstance(command, list):
+        if not command or not all(isinstance(x, str) for x in command):
+            return []
+        if len(command) >= 3 and os.path.basename(command[0]) in ("bash", "sh", "zsh") \
+                and command[1] in ("-lc", "-c"):
+            text = command[-1]            # the script handed to the shell
+        else:
+            text = shlex.join(command)    # argv: keep quoting intact
+    elif isinstance(command, str):
+        text = command
+    else:
+        return []
+    cur = cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None
+    found = []
+
+    def add(tok):
+        # a relative path is only usable while the working directory is known
+        if not _literal_path(tok) or (not os.path.isabs(tok) and cur is None):
+            return
+        p = tok if os.path.isabs(tok) else os.path.normpath(os.path.join(cur, tok))
+        if p not in found:
+            found.append(p)
+
+    # Tokenize the whole script at once (quoted strings may span lines); unquoted
+    # newlines are command separators.
+    try:
+        lx = shlex.shlex("\n".join(_strip_heredocs(text)), posix=True,
+                         punctuation_chars="();<>|&\n")
+        lx.whitespace = " \t\r"
+        lx.whitespace_split = True
+        toks = list(lx)
+    except ValueError:
+        return []          # unparseable (e.g. unbalanced quotes): infer nothing
+    seg = []
+    for tok in toks + [";"]:
+        if tok not in _SEGMENT_OPS:
+            seg.append(tok)
+            continue
+        # redirections anywhere in the segment
+        words = []
+        i = 0
+        while i < len(seg):
+            t = seg[i]
+            if t in _REDIRECT_OPS and i + 1 < len(seg):
+                add(seg[i + 1]); i += 2; continue
+            if t in ("<", "<<", "<<<", ">&", "<&") and i + 1 < len(seg):
+                i += 2; continue
+            words.append(t); i += 1
+        while words and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]) or words[0] in ("sudo", "command", "exec", "nohup", "time")):
+            words.pop(0)
+        if words:
+            cmd, args = os.path.basename(words[0]), words[1:]
+            plain = [a for a in args if not a.startswith("-")]
+            if cmd == "cd":
+                tgt = plain[0] if plain else None
+                if tgt and _literal_path(tgt):
+                    cur = tgt if os.path.isabs(tgt) else (os.path.normpath(os.path.join(cur, tgt)) if cur else None)
+                else:
+                    cur = None
+            elif cmd in ("tee", "rm", "touch"):
+                for a in plain:
+                    add(a)
+            elif cmd in ("cp", "mv") and len(plain) >= 2:
+                dst = plain[-1]
+                if dst.endswith("/") and len(plain) == 2:       # cp a.py dir/ -> dir/a.py
+                    dst = dst + os.path.basename(plain[0].rstrip("/"))
+                if cmd == "mv":                                 # mv also removes the sources
+                    for a in plain[:-1]:
+                        add(a)
+                add(dst)
+            elif cmd == "dd":
+                for a in args:
+                    if a.startswith("of="):
+                        add(a[3:])
+            elif cmd == "sed" and any(a == "--in-place" or re.match(r"^-[a-zA-Z]*i", a) for a in args):
+                files, script_given, skip = [], False, False
+                for a in args:
+                    if skip:
+                        skip = False; continue
+                    if a in ("-e", "-f", "--expression", "--file"):
+                        script_given, skip = True, True; continue
+                    if a.startswith("-"):
+                        continue
+                    files.append(a)
+                for a in (files if script_given else files[1:]):
+                    add(a)
+            elif cmd == "git" and plain:
+                sub, rest = plain[0], args[args.index(plain[0]) + 1:]
+                if sub in ("checkout", "restore") and ("--" in rest or sub == "restore"):
+                    for a in (rest[rest.index("--") + 1:] if "--" in rest else rest):
+                        if not a.startswith("-"):
+                            add(a)
+                elif sub in ("rm", "mv"):
+                    for a in rest:
+                        if not a.startswith("-"):
+                            add(a)
+        seg = []
+    return found
+
 def _shell_text(v):
     """A command given as an argv list -> one string (`bash -lc "x"` -> `x`)."""
     if isinstance(v, list) and v and all(isinstance(x, str) for x in v):
@@ -1024,7 +1159,15 @@ def parse(chain, outdir, data_prefix, data_ctr, profile=None):
                 tid = b.get("id", "")
                 inp = b.get("input", {})
                 hl = f">>>tool_call {name}:{_short_tid(tid)}"
-                files = tool_files(name, inp)
+                files = [(p, m, False) for p, m in tool_files(name, inp)]
+                if isinstance(inp, dict):
+                    wd = next((inp[k] for k in _CWD_KEYS if isinstance(inp.get(k), str)), None) \
+                        or (r.get("cwd") if isinstance(r.get("cwd"), str) else None)
+                    for k in _SHELL_KEYS:
+                        if k in inp:
+                            known = {f[0] for f in files}
+                            files += [(p, True, True) for p in shell_writes(inp[k], wd)
+                                      if p not in known]
                 summary = _tool_summary(name, inp, files)
                 ir.append(_node("meta", [hl], _sec=sec, _blk=blk,
                                  _tool_summary=summary, _tool_name=name,
@@ -1571,10 +1714,11 @@ def lower_files(ir, filename="", cwd=None):
         name, tid = o.get("_tool_name", "?"), o.get("_tool_tid", "")
         ref = _call_ref(o, blk_range, tid_ranges)
         err = tid in err_tids
-        for path, mod in o["_tool_files"]:
+        for path, mod, inferred in o["_tool_files"]:
             f = files.setdefault(path, {"ops": [], "last": idx, "last_op": name,
                                         "last_ts": None, "modified": False})
-            f["ops"].append(f"  {name:<12} ({short}:{ref})" + (" error" if err else ""))
+            label = name + ("~" if inferred else "")
+            f["ops"].append(f"  {label:<12} ({short}:{ref})" + (" error" if err else ""))
             f["last"], f["last_op"], f["last_ts"] = idx, name, o.get("_ts")
             if mod and not err:
                 f["modified"] = True
@@ -1587,8 +1731,8 @@ def lower_files(ir, filename="", cwd=None):
     if cwd:
         out.append(f"cwd: {cwd}")
     out.append(f"Pointers are (call, result) line ranges in {short}. Newest-touched first.")
-    out.append("Changes made by shell commands or outside this session are NOT tracked: "
-               "re-read files before relying on them.")
+    out.append("~ = write inferred from a shell command (literal paths only, may be incomplete). "
+               "Changes outside this session are NOT tracked: re-read files before relying on them.")
     for path, f in sorted(files.items(), key=lambda kv: -kv[1]["last"]):
         ts = _fmt_ts(f["last_ts"])
         out.append("")
@@ -1675,9 +1819,9 @@ def build_turns(ir):
         if err:
             rr = tid_ranges.get(tid)
             t["errors"].append((name, f"{rr[0]+1}-{rr[1]+1}" if rr else "?"))
-        for path, mod in o.get("_tool_files") or ():
+        for path, mod, inferred in o.get("_tool_files") or ():
             t["files"].setdefault(path, []).append(
-                (name, err, _call_ref(o, blk_range, tid_ranges), mod))
+                (name + ("~" if inferred else ""), err, _call_ref(o, blk_range, tid_ranges), mod))
     if pre["tools"] or pre["errors"] or pre["agents"]:
         turns.insert(0, pre)
     return turns
@@ -1775,7 +1919,7 @@ def lower_graph(ir, filename="", cwd=None, turns=None, agent_id=None, agent_logs
         head.append(f"cwd: {cwd}")
     head.append("T = user turn (its message and the work it triggered). M/R = modified/read in that turn.")
     head.append("[prev Tn] = the last earlier turn that touched the same file. "
-                "File changes made by shell commands are not tracked.")
+                "Name~ = write inferred from a shell command (may be incomplete).")
     if nagents:
         head.append("subagent <id> -> <log> = a subagent this turn started, and its own log "
                     "(compile it with VCC to read it).")
