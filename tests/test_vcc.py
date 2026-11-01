@@ -367,6 +367,9 @@ class TestToolSemantics(unittest.TestCase):
                          {"src/app.py": True, "src/new.py": True})
         diff = "--- a/x.c\n+++ b/x.c\n@@ -1 +1 @@\n-a\n+b\n--- /dev/null\n+++ b/y.c\n"
         self.assertEqual(self.files("run", {"diff": diff}), {"x.c": True, "y.c": True})
+        # a diff written into a file as its content is data, not an applied patch
+        self.assertEqual(self.files("Write", {"file_path": "/fix.patch", "content": diff}),
+                         {"/fix.patch": True})
 
     def test_summary_uses_argument_keys(self):
         self.assertEqual(VCC._tool_summary("WebSearch", {"query": "bm25"}), '* WebSearch "bm25"')
@@ -397,6 +400,15 @@ class TestShellWrites(unittest.TestCase):
         self.assertEqual(self.w("cp src/a.py backup/ && dd if=/dev/zero of=disk.img"),
                          ["/w/backup/a.py", "/w/disk.img"])
         self.assertEqual(self.w("mv old.py new/"), ["/w/old.py", "/w/new/old.py"])
+
+    def test_fd_numbers_subshells_and_bsd_sed(self):
+        # the fd of `2>/dev/null` / `2>&1` is not a file argument
+        self.assertEqual(self.w("rm -f a.txt 2>/dev/null"), ["/w/a.txt"])
+        self.assertEqual(self.w("cp a.py b.py 2>&1"), ["/w/b.py"])
+        # BSD `sed -i ''`: the empty backup suffix is not the script
+        self.assertEqual(self.w("sed -i '' 's/a/b/' f.txt"), ["/w/f.txt"])
+        # a `cd` inside ( ... ) does not leak out
+        self.assertEqual(self.w("cd /a && (cd b && rm x) && rm y"), ["/a/b/x", "/a/y"])
 
     def test_reads_and_unknowns_are_ignored(self):
         self.assertEqual(self.w("sed -n '1,5p' f.txt; grep -r x . | head; cat a.txt"), [])
@@ -541,6 +553,15 @@ class TestUniversalReader(VCCTestCase):
     def test_reasoning_and_call_are_one_assistant_turn(self):
         full, _, _ = self.compile_dialect("openai_responses")
         self.assertRegex(full, r"\[assistant\]\n\n>>>thinking\nOverwrite the file.\n<<<thinking\n\n>>>tool_call")
+        # real Responses items carry their own ids (rs_..., msg_...): still one turn
+        _write_jsonl(self.jsonl, [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            {"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "Greet."}]},
+            {"type": "message", "id": "msg_1", "role": "assistant",
+             "content": [{"type": "output_text", "text": "Hello."}]}])
+        self.compile()
+        self.assertRegex("\n".join(self.read("session.txt")),
+                         r"\[assistant\]\n\n>>>thinking\nGreet.\n<<<thinking\n\nHello.")
 
     def test_envelopes_and_documents(self):
         # {"type": role, "message": {...}} envelopes, and a whole-file {"messages": [...]} document
@@ -550,6 +571,11 @@ class TestUniversalReader(VCCTestCase):
         self.assertIn("[user] 2026-06-01 10:00Z\n\nhello there", "\n".join(self.read("session.txt")))
         with open(self.jsonl, "w") as f:
             json.dump({"messages": self.DIALECTS["openai_chat"]}, f, indent=2)
+        self.compile()
+        self.assertIn("Done.", "\n".join(self.read("session.txt")))
+        # a whole-file JSON array written on one line (json.dump default)
+        with open(self.jsonl, "w") as f:
+            json.dump(self.DIALECTS["openai_chat"], f)
         self.compile()
         self.assertIn("Done.", "\n".join(self.read("session.txt")))
 
@@ -562,6 +588,27 @@ class TestUniversalReader(VCCTestCase):
         ])
         self.compile()
         self.assertIn("[tool_error] shell:g1\n\nmake: *** failed", "\n".join(self.read("session.txt")))
+
+    def test_anthropic_message_objects_are_not_merged(self):
+        # Anthropic API message objects also carry "type": "message"; two consecutive
+        # assistant messages must stay two turns
+        _write_jsonl(self.jsonl, [
+            {"role": "user", "content": "hi"},
+            {"id": "msg_a", "type": "message", "role": "assistant", "content": [{"type": "text", "text": "One."}]},
+            {"id": "msg_b", "type": "message", "role": "assistant", "content": [{"type": "text", "text": "Two."}]}])
+        self.compile()
+        self.assertEqual("\n".join(self.read("session.txt")).count("[assistant]"), 2)
+
+    def test_legacy_openai_function_call(self):
+        _write_jsonl(self.jsonl, [
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": None,
+             "function_call": {"name": "get_weather", "arguments": json.dumps({"city": "Oslo"})}},
+            {"role": "function", "name": "get_weather", "content": "rain"}])
+        self.compile()
+        full = "\n".join(self.read("session.txt"))
+        self.assertIn(">>>tool_call get_weather:eather\ncity: Oslo", full)
+        self.assertIn("[tool] get_weather:eather\n\nrain", full)
 
     def test_claude_code_is_detected_only_by_its_own_markers(self):
         _write_jsonl(self.jsonl, [{"type": "user", "sessionId": "s", "parentUuid": None,
@@ -580,6 +627,11 @@ class TestCLI(VCCTestCase):
         r = self.run_cli("--limit", "3")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("require --grep", r.stderr)
+
+    def test_negative_limit_rejected(self):
+        r = self.run_cli("--grep", "x", "--limit", "-1")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--limit must be >= 0", r.stderr)
 
     def test_bad_time(self):
         r = self.run_cli("--grep", "x", "--since", "yesterday")

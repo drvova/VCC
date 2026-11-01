@@ -26,12 +26,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
 def _copy_if_newer(src, dst):
+    """Copy src to dst unless dst is at least as new; returns True if it copied."""
     if os.path.exists(dst) and os.path.getmtime(dst) >= os.path.getmtime(src):
-        return
+        return False
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     tmp = dst + ".tmp"
     shutil.copy2(src, tmp)
     os.replace(tmp, dst)  # atomic: a reader never sees a half-written archive copy
+    return True
 
 
 def archive(transcript, archive_dir):
@@ -66,9 +68,7 @@ def sweep(src, archive_dir):
             if fn.endswith(_LOG_EXTS):
                 s = os.path.join(dirpath, fn)
                 d = os.path.join(dest_root, os.path.relpath(s, src))
-                if not (os.path.exists(d) and os.path.getmtime(d) >= os.path.getmtime(s)):
-                    _copy_if_newer(s, d)
-                    n += 1
+                n += _copy_if_newer(s, d)
     return n
 
 

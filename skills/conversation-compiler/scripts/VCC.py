@@ -385,6 +385,8 @@ def load_records(path):
         except ValueError:
             bad += 1
     if recs and not bad:
+        if len(recs) == 1 and isinstance(recs[0], list):
+            return recs[0]       # a whole-file JSON array written on one line
         return recs
     try:
         doc = json.loads(data)
@@ -482,7 +484,18 @@ def _iter_messages(recs):
         else:
             yield r, r
 
-_RESPONSE_ITEM_TYPES = {"message", "reasoning", "function_call", "custom_tool_call"}
+_RESPONSE_ITEM_TYPES = {"reasoning", "function_call", "custom_tool_call"}
+_RESPONSE_TEXT_TYPES = {"input_text", "output_text", "refusal"}
+
+def _is_response_item(m):
+    """True for an OpenAI Responses output item. A Responses `message` item is told apart
+    from an Anthropic message object (which also has type "message") by its content items
+    (input_text / output_text / refusal instead of text / tool_use blocks)."""
+    t = m.get("type")
+    if t in _RESPONSE_ITEM_TYPES:
+        return True
+    return t == "message" and isinstance(m.get("content"), list) and any(
+        isinstance(c, dict) and c.get("type") in _RESPONSE_TEXT_TYPES for c in m["content"])
 
 def _texts(items):
     """Text of a content value: string, or a list of {text}/{type: *_text} items."""
@@ -515,7 +528,7 @@ def adapt_chat(recs):
         ts = m.get("timestamp") or env.get("timestamp") or m.get("created_at") or env.get("time")
         rec = {"type": rtype, "timestamp": ts if isinstance(ts, str) else None,
                "message": {"id": mid, "content": content}}
-        if m.get("type") in _RESPONSE_ITEM_TYPES:
+        if _is_response_item(m):
             rec["_item"] = True       # one piece of a single model response
         cwd = m.get("cwd") or env.get("cwd")
         if isinstance(cwd, str):
@@ -593,6 +606,10 @@ def adapt_chat(recs):
         blocks = _chat_blocks(m.get("content"))
         if m.get("reasoning_content"):
             blocks.insert(0, {"type": "thinking", "thinking": m["reasoning_content"]})
+        fc = m.get("function_call")
+        if isinstance(fc, dict):    # legacy OpenAI Chat; its result is {role: "function", name}
+            blocks.append({"type": "tool_use", "id": fc.get("name") or "", "name": fc.get("name") or "tool",
+                           "input": _args_dict(fc.get("arguments"))})
         for tc in m.get("tool_calls") or []:
             fn = tc.get("function") or {}
             blocks.append({"type": "tool_use", "id": tc.get("id", ""),
@@ -612,12 +629,14 @@ def adapt_chat(recs):
     prev = None
     for r in out:
         msg = r.get("message") or {}
-        if r["type"] == "assistant" and r.pop("_item", False) and not msg.get("id"):
-            if prev is not None:
-                msg["id"] = prev
-            else:
-                n_ids += 1
-                msg["id"] = prev = f"turn-{n_ids}"
+        if r["type"] == "assistant" and r.pop("_item", False):
+            if prev is None:
+                if msg.get("id"):
+                    prev = msg["id"]
+                else:
+                    n_ids += 1
+                    prev = f"turn-{n_ids}"
+            msg["id"] = prev
         else:
             r.pop("_item", None)
             prev = None
@@ -715,6 +734,8 @@ _PATH_LIST_KEYS = ("paths", "file_paths", "files")
 _SCOPE_KEYS = ("pattern", "query", "regex", "glob", "include")
 _MODIFY_KEYS = ("content", "contents", "file_text", "new_string", "old_string", "new_str",
                 "old_str", "newString", "oldString", "edits", "patch", "diff", "new_source")
+_FILE_TEXT_KEYS = {"content", "contents", "file_text", "new_string", "old_string", "new_str",
+                   "old_str", "newString", "oldString", "edits", "new_source"}
 _MODIFY_VERB_RE = re.compile(r"write|edit|patch|replace|create|delete|remove|rename|move"
                              r"|insert|append|save", re.I)
 _PATCH_FILE_RE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+?)\s*$"
@@ -739,7 +760,13 @@ def tool_files(name, inp):
     if not isinstance(inp, dict):
         return []
     out = {}
-    for s in _strings_in(inp):
+    # Text written into a named file (Write content, Edit strings) is data: a diff inside
+    # it is not applied, so it names no modified files.
+    if any(_is_pathlike(inp.get(k)) for k in _PATH_KEYS):
+        scan = {k: v for k, v in inp.items() if k not in _FILE_TEXT_KEYS}
+    else:
+        scan = inp
+    for s in _strings_in(scan):
         if "*** " in s or "+++ " in s:
             for m in _PATCH_FILE_RE.finditer(s):
                 p = next(g for g in m.groups() if g)
@@ -762,6 +789,7 @@ _CWD_KEYS = ("workdir", "working_directory", "cwd", "directory")
 _HEREDOC_RE = re.compile(r"<<(-?)\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
 _SEGMENT_OPS = {";", "&&", "||", "|", "&", "(", ")", "|&", ";;", "\n"}
 _REDIRECT_OPS = {">", ">>", ">|", "&>", "&>>"}
+_FD_REDIRECT_OPS = {">", ">>", ">|", "<", ">&", "<&"}
 
 def _strip_heredocs(text):
     """Drop heredoc bodies (they are data, not commands); join backslash continuations.
@@ -824,7 +852,7 @@ def shell_writes(command, cwd=None):
         toks = list(lx)
     except ValueError:
         return []          # unparseable (e.g. unbalanced quotes): infer nothing
-    seg = []
+    seg, subshells = [], []
     for tok in toks + [";"]:
         if tok not in _SEGMENT_OPS:
             seg.append(tok)
@@ -838,6 +866,8 @@ def shell_writes(command, cwd=None):
                 add(seg[i + 1]); i += 2; continue
             if t in ("<", "<<", "<<<", ">&", "<&") and i + 1 < len(seg):
                 i += 2; continue
+            if t.isdigit() and i + 1 < len(seg) and seg[i + 1] in _FD_REDIRECT_OPS:
+                i += 1; continue           # the fd of `2>/dev/null`, `2>&1`: not an argument
             words.append(t); i += 1
         while words and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]) or words[0] in ("sudo", "command", "exec", "nohup", "time")):
             words.pop(0)
@@ -872,8 +902,8 @@ def shell_writes(command, cwd=None):
                         skip = False; continue
                     if a in ("-e", "-f", "--expression", "--file"):
                         script_given, skip = True, True; continue
-                    if a.startswith("-"):
-                        continue
+                    if not a or a.startswith("-"):
+                        continue           # '' = BSD `sed -i '' ...` backup suffix
                     files.append(a)
                 for a in (files if script_given else files[1:]):
                     add(a)
@@ -888,6 +918,11 @@ def shell_writes(command, cwd=None):
                         if not a.startswith("-"):
                             add(a)
         seg = []
+        # a `cd` inside `( ... )` does not change the directory outside it
+        if tok == "(":
+            subshells.append(cur)
+        elif tok == ")" and subshells:
+            cur = subshells.pop()
     return found
 
 def _shell_text(v):
@@ -2139,6 +2174,8 @@ def main():
         a.grep = re.compile(a.grep) if a.grep else None
     except re.error as e:
         p.error(f"invalid regex for --grep: {e}")
+    if a.limit < 0:
+        p.error("--limit must be >= 0")
     if (a.role or a.since or a.until or a.limit or a.rank) and not a.grep:
         p.error("--role/--since/--until/--limit/--rank require --grep (use --grep . to match everything)")
     try:
