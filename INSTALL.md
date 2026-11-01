@@ -20,15 +20,13 @@ VCC can only read logs that still exist. By default Claude Code **deletes logs o
 { "cleanupPeriodDays": 3650 }
 ```
 
-Gemini CLI also cleans up old sessions (30 days by default; see its session-management settings). Codex keeps rollouts but compresses those older than 7 days to `.jsonl.zst`, which VCC reads with Python 3.14+ or `pip install zstandard`.
-
-For any harness, `vcc_hook.py --sweep` mirrors a log directory into an archive (log files only, copied only when newer; it never deletes anything). Run it from cron, e.g. hourly:
+Alternatively (or additionally), `vcc_hook.py --sweep` mirrors a log directory into an archive (log files only, copied only when newer; it never deletes anything). Run it from cron, e.g. hourly:
 
 ```
-0 * * * * python3 /path/to/conversation-compiler/scripts/vcc_hook.py --archive ~/agent-log-archive --sweep ~/.claude/projects --sweep ~/.codex/sessions --sweep ~/.gemini/tmp
+0 * * * * python3 /path/to/conversation-compiler/scripts/vcc_hook.py --archive ~/agent-log-archive --sweep ~/.claude/projects
 ```
 
-Search the archive like any log directory. A harness that later compresses or converts a log (Codex `.jsonl` → `.jsonl.zst`, Gemini CLI `.json` → `.jsonl`) can leave both copies in the archive, so a conversation may show up twice.
+Search the archive like any log directory.
 
 ## Optional hooks (Claude Code)
 

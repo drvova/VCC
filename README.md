@@ -8,7 +8,7 @@ Official implementation of "View-oriented Conversation Compiler for Agent Trace 
 
 This repo is for daily use. To reproduce academic experiments in the paper, see [VCC-experiments](https://github.com/lllyasviel/VCC-experiments).
 
-VCC is a compiler that compiles your conversation logs (Claude Code's JSONL; in this fork also Codex CLI, Gemini CLI and generic chat JSONL) into efficient and agent-friendly views. Then you will never fear Claude Code's `/compact` - CC now can finally see the original details of compacted context. It also supports searching across all your Claude Code conversations.
+VCC is a compiler that compiles your conversation logs (Claude Code's JSONL) into efficient and agent-friendly views. Then you will never fear Claude Code's `/compact` - CC now can finally see the original details of compacted context. It also supports searching across all your Claude Code conversations.
 
 Things that tend to happen after you install VCC:
 
@@ -21,7 +21,7 @@ There is also a [paper](https://arxiv.org/abs/2603.29678) showing that VCC impro
 
 # Install
 
-The skills install into Claude Code. The compiler itself (`skills/conversation-compiler/scripts/VCC.py`, Python 3.10+, no dependencies) runs standalone on Claude Code, Codex CLI and Gemini CLI logs, or on any harness's log exported as role/content chat JSONL.
+Currently We support Claude Code only. In this fork the compiler also reads generic role/content chat JSONL (`--harness chat`), which other agents' logs can be converted to.
 
 To install, copy this to your Claude Code:
 
@@ -249,13 +249,13 @@ The adaptive view keeps conversation order so it is good for understanding conte
 
 ## Additions in this fork
 
-* **Harness-neutral core**: input adapters for Claude Code, Codex CLI (`rollout-*.jsonl`, also `.jsonl.zst`) and Gemini CLI (`session-*.jsonl` / legacy `.json`), plus a generic role/content chat JSONL adapter for anything else; detected per file (`--harness` to override). Tool calls are understood from argument shapes (path / content / patch arguments), not tool names, and harness noise rules live in per-harness profiles applied once at parse time, so every view and lowering pass is harness-neutral.
+* **Harness-neutral core**: tool calls are understood from argument shapes (path / content / patch / command arguments), not tool names, and Claude Code's noise rules live in one profile applied at parse time, so every view and lowering pass is harness-neutral. Besides Claude Code JSONL, a generic role/content chat JSONL input (`--harness chat`, auto-detected) is supported.
 * **Timestamps**: `[user]` headers and every `--grep` hit show the UTC time (`[user] 2026-04-02 10:31Z`).
 * **Search filters**: `--role tool_error`, `--since 2026-04-01`, `--until 2026-04-30`, `--limit 30`. They apply to both the stdout hits and `.view.txt`. `--grep . --role tool_error` lists every failed tool call.
 * **Files view** (`.files.txt`): every file the conversation read or modified, newest first, with `(call, result)` pointers into the full view. `/recall` uses it as the checklist of files to re-read. Writes done through shell commands (redirections, `tee`, `sed -i`, `mv`, `cp`, `rm`, `touch`, `git checkout/restore`…) are inferred conservatively and marked `~`; heredoc bodies, variables and globs are never guessed.
 * **BM25 ranking** (`--rank`): the regex selects blocks, BM25 orders them by relevance to the pattern's words (rarer terms and shorter, focused blocks first). Use an alternation of synonyms as the query: `--grep "captcha|recaptcha|bot.?detect" --rank --limit 20`. Works with CJK text.
 * **Graph view** (`--graph` → `.graph.txt`): each user turn linked to the files it read/modified, its tool errors, the subagents it started (with the path to each subagent's own log), and `[prev Tn]` links to the last earlier turn on the same file. With several JSONL files, stdout gets a cross-conversation file index ("where else did we work on this file?").
-* **Keeping logs** (`vcc_hook.py`): as a Claude Code hook it compiles views when compaction starts and/or archives the session; for any harness, `--sweep` (e.g. from cron) mirrors log directories into an archive so they survive cleanup (Claude Code and Gemini CLI delete after 30 days by default). See INSTALL.md.
+* **Keeping logs** (`vcc_hook.py`): as a Claude Code hook it compiles views when compaction starts and/or archives the session; `--sweep` (e.g. from cron) mirrors a log directory into an archive. Both keep logs past Claude Code's 30-day `cleanupPeriodDays` deletion. See INSTALL.md.
 * **Faster**: lowering no longer rescans the whole IR per section (~1.8x faster on large logs, identical output).
 * **Evaluation**: `eval/longmemeval_retrieval.py` measures search on LongMemEval_S (470 questions, no LLM). Evidence in the top 10 hits: 19.6% newest-first vs **87.9% with `--rank`**. See `eval/README.md`.
 * **Tests**: `python -m unittest discover tests`.

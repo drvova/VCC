@@ -339,8 +339,8 @@ class TestToolSemantics(unittest.TestCase):
         self.assertEqual(self.files("Grep", {"pattern": "x", "path": "/src"}), {})   # search scope
         self.assertEqual(self.files("Bash", {"command": "ls"}), {})
 
-    def test_other_harness_shapes(self):
-        # Gemini CLI style
+    def test_other_argument_shapes(self):
+        # other argument names for the same effects
         self.assertEqual(self.files("read_file", {"absolute_path": "/a.py"}), {"/a.py": False})
         self.assertEqual(self.files("replace", {"file_path": "/a.py", "old_string": "a",
                                                 "new_string": "b"}), {"/a.py": True})
@@ -468,208 +468,6 @@ class TestChatAdapter(VCCTestCase):
         self.assertIn('"Fix the bug in util.py"', "\n".join(self.read("session.graph.txt")))
 
 
-class TestGeminiAdapter(VCCTestCase):
-    """Gemini CLI session JSONL, per chatRecordingService.ts: metadata line, message lines
-    (repeated ids: last write wins, first write keeps position), $set/$patch/$rewindTo."""
-
-    def setUp(self):
-        super().setUp()
-        self.jsonl = os.path.join(self.dir, "session-2026-06-01T10-00-abcd1234.jsonl")
-        self.recs = [
-            {"sessionId": "s1", "projectHash": "h", "startTime": "2026-06-01T10:00:00Z",
-             "lastUpdated": "2026-06-01T10:00:00Z"},
-            {"id": "u1", "timestamp": "2026-06-01T10:00:00Z", "type": "user",
-             "content": [{"text": "Read config.toml and bump the version"}]},
-            {"$set": {"lastUpdated": "2026-06-01T10:00:01Z"}},
-            {"id": "g1", "timestamp": "2026-06-01T10:00:05Z", "type": "gemini", "content": "",
-             "thoughts": [{"subject": "Plan", "description": "Read then edit.",
-                           "timestamp": "2026-06-01T10:00:04Z"}],
-             "toolCalls": [{"id": "c1", "name": "read_file", "args": {"absolute_path": "/p/config.toml"},
-                            "status": "success", "timestamp": "2026-06-01T10:00:05Z"}]},
-            # same id re-appended (the full object, as pushMessage does) with a second call:
-            # replaces the first copy, keeps its position
-            {"id": "g1", "timestamp": "2026-06-01T10:00:05Z", "type": "gemini", "content": "",
-             "thoughts": [{"subject": "Plan", "description": "Read then edit.",
-                           "timestamp": "2026-06-01T10:00:04Z"}],
-             "model": "gemini-x", "tokens": {"input": 100, "output": 20, "cached": 40, "total": 120},
-             "toolCalls": [
-                 {"id": "c1", "name": "read_file", "args": {"absolute_path": "/p/config.toml"},
-                  "status": "success", "timestamp": "2026-06-01T10:00:05Z"},
-                 {"id": "c2", "name": "replace", "args": {"file_path": "/p/config.toml",
-                                                          "old_string": "1.0", "new_string": "1.1"},
-                  "status": "error", "timestamp": "2026-06-01T10:00:06Z"}]},
-            {"$patch": {"updates": [{"id": "g1", "toolCalls": [{"id": "c1", "result": [
-                {"functionResponse": {"id": "c1", "name": "read_file",
-                                      "response": {"output": "version = \"1.0\""}}}]}]}]}},
-            {"id": "g2", "timestamp": "2026-06-01T10:00:09Z", "type": "gemini",
-             "content": [{"text": "The edit failed; version is still 1.0."}]},
-            {"id": "u2", "timestamp": "2026-06-01T10:01:00Z", "type": "user",
-             "content": "never mind"},
-            {"$rewindTo": "u2"},       # user rewound: u2 is gone
-        ]
-        _write_jsonl(self.jsonl, self.recs)
-
-    def test_replay(self):
-        meta, msgs = VCC._gemini_messages(self.recs)
-        self.assertEqual([m["id"] for m in msgs], ["u1", "g1", "g2"])
-        self.assertEqual(len(msgs[1]["toolCalls"]), 2)
-        self.assertIsNotNone(msgs[1]["toolCalls"][0]["result"])
-
-    def test_compile(self):
-        recs, profile, harness = VCC.load(self.jsonl)
-        self.assertEqual(harness, "gemini-cli")
-        self.compile(graph=True)
-        stem = os.path.splitext(os.path.basename(self.jsonl))[0]
-        full = "\n".join(self.read(stem + ".txt"))
-        self.assertIn("[user] 2026-06-01 10:00Z", full)
-        self.assertIn("Read config.toml and bump the version", full)
-        self.assertIn("Plan\nRead then edit.", full)                 # thought -> thinking
-        self.assertIn('version = "1.0"', full)                       # patched-in tool result
-        self.assertIn("[tool_error] replace:c2", full)
-        self.assertNotIn("never mind", full)                         # rewound away
-        self.assertIn("model: gemini-x", full)                       # stats footer
-        self.assertIn("input: 60  cache_read: 40", full)
-        files = "\n".join(self.read(stem + ".files.txt"))
-        self.assertIn("R /p/config.toml", files)                     # the edit failed
-        graph = "\n".join(self.read(stem + ".graph.txt"))
-        self.assertIn("errors: replace", graph)
-
-    def test_subagent_ids(self):
-        recs = [dict(r) for r in self.recs]
-        recs[4] = dict(recs[4], toolCalls=[dict(recs[4]["toolCalls"][0], agentId="sub-9")]
-                      + recs[4]["toolCalls"][1:])
-        out = VCC.adapt_gemini(recs)
-        results = [b for r in out for b in (r["message"]["content"] if isinstance(
-            r.get("message", {}).get("content"), list) else []) if b.get("type") == "tool_result"]
-        self.assertEqual(results[0].get("agent_id"), "sub-9")
-        child = VCC.adapt_gemini([{"sessionId": "sub-9", "projectHash": "h", "kind": "subagent",
-                                   "startTime": "x", "lastUpdated": "x"},
-                                  {"id": "a", "timestamp": "2026-06-01T10:00:00Z", "type": "user",
-                                   "content": "task"}])
-        self.assertEqual(child[0]["agentId"], "sub-9")
-
-    def test_legacy_single_json(self):
-        legacy = os.path.join(self.dir, "session-old.json")
-        with open(legacy, "w") as f:
-            json.dump({"sessionId": "s0", "projectHash": "h", "startTime": "x", "lastUpdated": "x",
-                       "messages": [{"id": "a", "timestamp": "2026-01-01T00:00:00Z", "type": "user",
-                                     "content": "hello from 2026"}]}, f, indent=2)
-        recs, profile, harness = VCC.load(legacy)
-        self.assertEqual(harness, "gemini-cli")
-        self.assertEqual(recs[0]["message"]["content"][0]["text"], "hello from 2026")
-
-
-class TestCodexAdapter(VCCTestCase):
-    """Codex CLI rollout lines {timestamp, type, payload}, per codex-rs protocol/history."""
-
-    PATCH = "*** Begin Patch\n*** Update File: src/app.py\n@@\n-x = 1\n+x = 2\n*** End Patch"
-
-    def setUp(self):
-        super().setUp()
-        self.jsonl = os.path.join(self.dir, "rollout-2026-06-01T10-00-00-abc.jsonl")
-
-        def line(ts, typ, payload):
-            return {"timestamp": f"2026-06-01T10:{ts}.000Z", "type": typ, "payload": payload}
-
-        def item(ts, payload):
-            return line(ts, "response_item", payload)
-
-        self.recs = [
-            line("00:00", "session_meta", {"id": "t1", "session_id": "t1", "timestamp": "x",
-                                           "cwd": "/repo", "originator": "codex_cli_rs",
-                                           "cli_version": "1.0.0", "model_provider": None,
-                                           "base_instructions": None}),
-            line("00:00", "turn_context", {"cwd": "/repo", "model": "gpt-x",
-                                           "approval_policy": "on-request",
-                                           "sandbox_policy": {"type": "workspace-write"}}),
-            item("00:01", {"type": "message", "role": "developer",
-                           "content": [{"type": "input_text", "text": "sandbox rules"}]}),
-            item("00:01", {"type": "message", "role": "user", "content": [
-                {"type": "input_text", "text": "<environment_context>\n<cwd>/repo</cwd>\n</environment_context>"}]}),
-            item("00:02", {"type": "message", "role": "user", "content": [
-                {"type": "input_text", "text": "Set x to 2 in src/app.py and run the tests"}]}),
-            line("00:02", "event_msg", {"type": "user_message", "message": "Set x to 2 ..."}),
-            item("00:03", {"type": "reasoning", "summary": [{"type": "summary_text",
-                                                             "text": "Need to patch app.py."}],
-                           "encrypted_content": "gAAA"}),
-            item("00:04", {"type": "function_call", "name": "shell", "call_id": "call_a",
-                           "arguments": json.dumps({"command": ["bash", "-lc", "cat src/app.py"]})}),
-            item("00:05", {"type": "function_call_output", "call_id": "call_a", "output": "x = 1\n"}),
-            item("00:06", {"type": "custom_tool_call", "name": "apply_patch", "call_id": "call_b",
-                           "input": self.PATCH}),
-            item("00:07", {"type": "custom_tool_call_output", "call_id": "call_b",
-                           "output": [{"type": "input_text", "text": "Success. Updated: src/app.py"}]}),
-            item("00:08", {"type": "function_call", "name": "shell", "call_id": "call_c",
-                           "arguments": json.dumps({"command": ["bash", "-lc", "pytest -q"]})}),
-            item("00:09", {"type": "function_call_output", "call_id": "call_c", "output": json.dumps(
-                {"output": "1 failed", "metadata": {"exit_code": 1, "duration_seconds": 0.5}})}),
-            item("00:10", {"type": "message", "role": "assistant", "phase": "final_answer",
-                           "content": [{"type": "output_text", "text": "Patched; one test fails."}]}),
-            line("00:11", "compacted", {"message": "Summary: x set to 2, a test fails.",
-                                        "replacement_history": [], "compaction_response_id": None,
-                                        "latest_token_usage_record": None}),
-            line("00:11", "event_msg", {"type": "context_compacted"}),
-            item("00:12", {"type": "message", "role": "user", "content": [
-                {"type": "input_text", "text": "Which test failed?"}]}),
-        ]
-        _write_jsonl(self.jsonl, self.recs)
-        self.stem = os.path.splitext(os.path.basename(self.jsonl))[0]
-
-    def test_detect(self):
-        recs, profile, harness = VCC.load(self.jsonl)
-        self.assertEqual(harness, "codex")
-        self.assertIs(profile, VCC.CODEX)
-
-    def test_compile_full_view(self):
-        self.compile(graph=True)
-        full = "\n".join(self.read(self.stem + "_1.txt"))     # split at the compaction
-        self.assertIn("[user] 2026-06-01 10:00Z", full)
-        self.assertIn(">>>thinking\nNeed to patch app.py.\n<<<thinking", full)
-        self.assertIn(">>>tool_call shell:call_a\ncommand:\n  - bash\n  - -lc\n  - cat src/app.py", full)
-        self.assertIn(">>>tool_call apply_patch:call_b\ninput: |", full)
-        self.assertIn("[tool_error] shell:call_c\n\n1 failed", full)      # exit_code 1
-        self.assertIn("Patched; one test fails.", full)
-        self.assertNotIn("Set x to 2 ...", full)                          # event_msg skipped
-        # consecutive assistant items (reasoning + call) share one section; tool outputs split them
-        self.assertEqual(full.count("[assistant]"), 4)
-        self.assertRegex(full, r"\[assistant\]\n\n>>>thinking\nNeed to patch app.py.\n<<<thinking\n\n"
-                               r">>>tool_call shell:call_a")
-        after = "\n".join(self.read(self.stem + "_2.txt"))
-        self.assertIn("[compact summary", after)
-        self.assertIn("Which test failed?", after)
-
-    def test_brief_and_views(self):
-        self.compile(graph=True)
-        brief = "\n".join(self.read(self.stem + "_1.min.txt"))
-        self.assertIn('* shell "cat src/app.py"', brief)
-        self.assertIn('* apply_patch "src/app.py"', brief)
-        self.assertNotIn("environment_context", brief)      # Codex profile strips injected context
-        self.assertNotIn("sandbox rules", brief)            # developer message = system section
-        files = "\n".join(self.read(self.stem + "_1.files.txt"))
-        self.assertIn("cwd: /repo", files)
-        self.assertIn("M src/app.py", files)
-        graph = "\n".join(self.read(self.stem + "_1.graph.txt"))
-        self.assertIn('"Set x to 2 in src/app.py and run the tests"', graph)
-        self.assertIn("errors: shell", graph)
-
-    def test_zst_input(self):
-        try:
-            from compression import zstd
-            compress = zstd.compress
-        except ImportError:
-            try:
-                import zstandard
-                compress = zstandard.ZstdCompressor().compress
-            except ImportError:
-                self.skipTest("no zstd codec available (needs Python 3.14+ or zstandard)")
-        zpath = self.jsonl + ".zst"
-        with open(self.jsonl, "rb") as f, open(zpath, "wb") as g:
-            g.write(compress(f.read()))
-        os.remove(self.jsonl)
-        res = VCC.compile_pass(zpath, quiet=True)
-        self.assertTrue(res[0][0].endswith(self.stem + "_1.txt"))
-
-
 class TestCLI(VCCTestCase):
     def run_cli(self, *args):
         return subprocess.run([sys.executable, os.path.join(SCRIPTS, "VCC.py"), self.jsonl, *args],
@@ -713,20 +511,20 @@ class TestHook(VCCTestCase):
         self.assertTrue(os.path.exists(os.path.join(arch, proj, "session", "subagents", "agent-1.jsonl")))
 
     def test_sweep_mirrors_logs_only(self):
-        src = os.path.join(self.dir, "codex", "sessions", "2026", "06", "01")
+        src = os.path.join(self.dir, "logs", "projects", "p1")
         os.makedirs(src)
-        for fn in ("rollout-a.jsonl", "rollout-b.jsonl.zst", "notes.txt"):
+        for fn in ("session-a.jsonl", "session-b.json", "notes.txt"):
             with open(os.path.join(src, fn), "w") as f:
                 f.write("{}\n")
         arch = os.path.join(self.dir, "arch")
-        root = os.path.join(self.dir, "codex")
+        root = os.path.join(self.dir, "logs")
         r = self.run_hook("", "--archive", arch, "--sweep", root)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("2 file(s) archived", r.stderr)
         copied = sorted(os.path.relpath(os.path.join(dp, f), arch)
                         for dp, _, fs in os.walk(arch) for f in fs)
         self.assertEqual(len(copied), 2)
-        self.assertTrue(all(c.endswith(("rollout-a.jsonl", "rollout-b.jsonl.zst")) for c in copied))
+        self.assertTrue(all(c.endswith(("session-a.jsonl", "session-b.json")) for c in copied))
         r = self.run_hook("", "--archive", arch, "--sweep", root)
         self.assertIn("0 file(s) archived", r.stderr)                 # idempotent
         r = self.run_hook("", "--archive", os.path.join(root, "a"), "--sweep", root)

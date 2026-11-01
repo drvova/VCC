@@ -7,11 +7,11 @@ As a Claude Code hook (reads the hook's JSON input from stdin):
                    so it survives Claude Code's cleanupPeriodDays deletion.
 For a manual run, pass --transcript PATH instead of piping hook JSON on stdin.
 
-For any harness (no hooks needed; e.g. from cron):
+Without hooks (e.g. from cron):
   --archive DIR --sweep SRC [--sweep SRC2 ...]
-                   copy every log file (.jsonl, .json, .jsonl.zst) under SRC into
+                   copy every log file (.jsonl, .json) under SRC into
                    DIR/<SRC path relative to home>/..., only when the source is newer.
-                   e.g. --sweep ~/.codex/sessions --sweep ~/.gemini/tmp
+                   e.g. --sweep ~/.claude/projects
 
 Never fails: errors go to stderr and it always exits 0.
 """
@@ -49,7 +49,7 @@ def archive(transcript, archive_dir):
                                os.path.join(dest, os.path.basename(stem), "subagents", fn))
 
 
-_LOG_EXTS = (".jsonl", ".json", ".jsonl.zst")
+_LOG_EXTS = (".jsonl", ".json")
 
 def sweep(src, archive_dir):
     """Mirror every log file under src into archive_dir; returns the number copied."""

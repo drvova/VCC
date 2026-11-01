@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """View-oriented Conversation Compiler (VCC) - compile coding-agent logs into adaptive views.
 
-Input: Claude Code, Codex CLI and Gemini CLI session logs, or generic role/content chat
-JSONL (detected per file; --harness to override). See "input adapters" below.
+Input: Claude Code session logs, or generic role/content chat JSONL that any other agent's
+log can be converted to (detected per file; --harness to override). See "input adapters".
 
 Produces per conversation chain:
   .txt       Full transcript (lossless rendering of JSONL)
@@ -361,16 +361,6 @@ CLAUDE_CODE = Profile(
     line_number_tools={"Read"},
 )
 
-GEMINI_CLI = Profile("gemini-cli")
-
-# Codex injects context as user-role messages. These tag names are not verified against a
-# current Codex release; if they are absent the rules simply never match.
-CODEX = Profile(
-    "codex",
-    noise_tools={"update_plan"},
-    strip_res=[re.compile(r'<(environment_context|user_instructions)>.*?</\1>\s*', re.DOTALL)],
-    meta_user_res=[re.compile(r'^# AGENTS\.md instructions for ')],
-)
 
 
 # ── input adapters ──
@@ -388,20 +378,7 @@ CODEX = Profile(
 
 def _read_bytes(path):
     with open(path, "rb") as f:
-        raw = f.read()
-    if not path.endswith(".zst"):
-        return raw
-    try:                                  # Codex compresses rollouts older than 7 days
-        from compression import zstd      # Python 3.14+
-        return zstd.decompress(raw)
-    except ImportError:
-        pass
-    try:
-        import zstandard
-        return zstandard.ZstdDecompressor().decompressobj().decompress(raw)
-    except ImportError:
-        raise SystemExit(f"{path}: reading .zst needs Python 3.14+ or `pip install zstandard` "
-                         f"(or decompress first: zstd -d {path})")
+        return f.read()
 
 def load_records(path):
     """Read a log file: JSONL, or a single JSON document (list of records or session object).
@@ -433,16 +410,11 @@ def load_records(path):
     return []
 
 def detect_harness(recs):
-    """Name of the adapter for these records: codex, claude-code, gemini-cli or chat."""
+    """Name of the adapter for these records: claude-code or chat."""
     dicts = [r for r in recs[:200] if isinstance(r, dict)]
-    if any(r.get("type") in _CODEX_TYPES and "payload" in r for r in dicts):
-        return "codex"
     if any(r.get("type") in ("user", "assistant", "system") and isinstance(r.get("message"), dict)
            for r in dicts) or any(r.get("type") in _DISCARD_T for r in dicts):
         return "claude-code"
-    if any(("sessionId" in r and "projectHash" in r) or r.get("type") == "gemini"
-           or "$set" in r or "$patch" in r or "$rewindTo" in r for r in dicts):
-        return "gemini-cli"
     if any("role" in r for r in dicts) or any(isinstance(r.get("messages"), list) for r in dicts):
         return "chat"
     return "claude-code"
@@ -530,157 +502,6 @@ def adapt_chat(recs):
         out.append({**base, "type": role, "message": {"id": m.get("id"), "content": blocks}})
     return out
 
-# -- Gemini CLI (~/.gemini/tmp/<project>/chats/session-*.jsonl, or legacy .json) --
-
-def _gemini_messages(recs):
-    """Replay the Gemini CLI session log: last write of a message id wins, first write
-    fixes its position; $patch / $rewindTo / $set lines are applied in order."""
-    from collections import OrderedDict
-    meta, msgs = {}, OrderedDict()
-    for r in recs:
-        if not isinstance(r, dict):
-            continue
-        if isinstance(r.get("messages"), list) and "sessionId" in r:   # legacy whole-file JSON
-            meta.update({k: v for k, v in r.items() if k != "messages"})
-            for m in r["messages"]:
-                if isinstance(m, dict) and isinstance(m.get("id"), str):
-                    msgs[m["id"]] = m
-        elif "$rewindTo" in r:
-            ids = list(msgs)
-            cut = ids.index(r["$rewindTo"]) if r["$rewindTo"] in msgs else 0
-            for k in ids[cut:]:
-                del msgs[k]
-        elif "$patch" in r:
-            pt = r["$patch"] if isinstance(r["$patch"], dict) else {}
-            ups = list(pt.get("updates") or [])
-            if pt.get("id"):
-                ups.insert(0, pt)
-            for u in ups:
-                m = msgs.get(u.get("id"))
-                if m is None:
-                    continue
-                m = dict(m)
-                if "content" in u:
-                    m["content"] = u["content"]
-                if isinstance(u.get("toolCalls"), list) and isinstance(m.get("toolCalls"), list):
-                    res = {tc.get("id"): tc for tc in u["toolCalls"] if isinstance(tc, dict)}
-                    m["toolCalls"] = [dict(tc, result=res[tc.get("id")].get("result"))
-                                      if tc.get("id") in res else tc for tc in m["toolCalls"]]
-                msgs[m["id"]] = m
-            for k in pt.get("removeIds") or []:
-                msgs.pop(k, None)
-            for k in pt.get("orderIds") or []:
-                if k in msgs:
-                    msgs.move_to_end(k)
-        elif "$set" in r:
-            st = r["$set"] if isinstance(r["$set"], dict) else {}
-            if isinstance(st.get("messages"), list):
-                msgs = OrderedDict((m["id"], m) for m in st["messages"]
-                                   if isinstance(m, dict) and isinstance(m.get("id"), str))
-            meta.update({k: v for k, v in st.items() if k != "messages"})
-        elif isinstance(r.get("id"), str):
-            msgs[r["id"]] = r
-        elif "sessionId" in r:
-            meta.update(r)
-    return meta, list(msgs.values())
-
-def _gemini_parts(content):
-    if content is None:
-        return []
-    if isinstance(content, (str, dict)):
-        content = [content]
-    return [p for p in content if isinstance(p, (str, dict))] if isinstance(content, list) else []
-
-def _gemini_response_text(parts):
-    out = []
-    for p in _gemini_parts(parts):
-        if isinstance(p, str):
-            out.append(p)
-        elif "functionResponse" in p:
-            resp = (p["functionResponse"] or {}).get("response")
-            if isinstance(resp, dict) and set(resp) <= {"output", "error"}:
-                out.extend(_json_text(v) for v in resp.values())
-            else:
-                out.append(_json_text(resp))
-        elif "text" in p:
-            out.append(p["text"])
-    return "\n".join(out)
-
-def adapt_gemini(recs):
-    meta, msgs = _gemini_messages(recs)
-    answered = {tc.get("id") for m in msgs for tc in (m.get("toolCalls") or [])
-                if isinstance(tc, dict) and tc.get("result") is not None}
-    cwd = (meta.get("directories") or [None])[0] if isinstance(meta.get("directories"), list) else None
-    out = []
-    for m in msgs:
-        ts, typ = m.get("timestamp"), m.get("type")
-        base = {"timestamp": ts, **({"cwd": cwd} if cwd else {})}
-        parts = _gemini_parts(m.get("content"))
-        texts = [p if isinstance(p, str) else p["text"] for p in parts
-                 if isinstance(p, str) or ("text" in p and not p.get("thought"))]
-        text = "\n".join(t for t in texts if t)
-        if typ == "user":
-            blocks = [{"type": "text", "text": text}] if text else []
-            for p in parts:   # tool responses not already attached to a recorded tool call
-                fr = p.get("functionResponse") if isinstance(p, dict) else None
-                if fr and fr.get("id") not in answered:
-                    blocks.append({"type": "tool_result", "tool_use_id": fr.get("id", ""),
-                                   "content": _gemini_response_text([p])})
-            if blocks:
-                out.append({**base, "type": "user", "message": {"content": blocks}})
-        elif typ == "gemini":
-            blocks = []
-            for th in m.get("thoughts") or []:
-                if isinstance(th, dict):
-                    t = "\n".join(x for x in (th.get("subject"), th.get("description")) if x)
-                    if t:
-                        blocks.append({"type": "thinking", "thinking": t})
-            blocks += [{"type": "thinking", "thinking": p["text"]} for p in parts
-                       if isinstance(p, dict) and p.get("thought") and p.get("text")]
-            if text:
-                blocks.append({"type": "text", "text": text})
-            calls = [tc for tc in (m.get("toolCalls") or []) if isinstance(tc, dict)]
-            if not calls:
-                calls = [dict(p["functionCall"], args=p["functionCall"].get("args"))
-                         for p in parts if isinstance(p, dict) and isinstance(p.get("functionCall"), dict)]
-            for tc in calls:
-                blocks.append({"type": "tool_use", "id": tc.get("id", ""), "name": tc.get("name", "tool"),
-                               "input": _args_dict(tc.get("args"))})
-            msg = {"id": m.get("id"), "content": blocks}
-            tok = m.get("tokens")
-            if isinstance(tok, dict):
-                cached = tok.get("cached", 0) or 0
-                msg["usage"] = {"input_tokens": max((tok.get("input", 0) or 0) - cached, 0),
-                                "cache_read_input_tokens": cached,
-                                "output_tokens": tok.get("output", 0) or 0}
-            if m.get("model"):
-                msg["model"] = m["model"]
-            if blocks:
-                out.append({**base, "type": "assistant", "message": msg})
-            results = []
-            for tc in calls:
-                res = tc.get("result")
-                body = _gemini_response_text(res) if res is not None else (
-                    tc.get("resultDisplay") if isinstance(tc.get("resultDisplay"), str) else None)
-                status = tc.get("status")
-                if body is None and status not in ("error", "cancelled"):
-                    continue
-                tr = {"type": "tool_result", "tool_use_id": tc.get("id", ""),
-                      "content": body or f"[{status}]",
-                      "is_error": status in ("error", "cancelled")}
-                if isinstance(tc.get("agentId"), str):
-                    tr["agent_id"] = tc["agentId"]
-                results.append(tr)
-            if results:
-                out.append({"timestamp": ts, **({"cwd": cwd} if cwd else {}),
-                            "type": "user", "message": {"content": results}})
-        elif typ in ("info", "error", "warning") and text:
-            out.append({**base, "type": "system", "content": f"[{typ}] {text}"})
-    if meta.get("kind") == "subagent" and isinstance(meta.get("sessionId"), str):
-        for r in out:
-            r["agentId"] = meta["sessionId"]
-    return out
-
 def adapt_claude(recs):
     """Claude Code logs already use the internal model; only the subagent link moves:
     toolUseResult.agentId (record level) -> agent_id on the tool_result block."""
@@ -695,152 +516,8 @@ def adapt_claude(recs):
             trs[0]["agent_id"] = tur["agentId"]
     return recs
 
-_CODEX_TYPES = {"session_meta", "response_item", "event_msg", "turn_context", "compacted"}
-
-def _codex_text(items):
-    """Text of Codex content items / function output (string or item array)."""
-    if isinstance(items, str):
-        return items
-    out = []
-    for it in items if isinstance(items, list) else []:
-        if isinstance(it, dict) and isinstance(it.get("text"), str):
-            out.append(it["text"])
-        elif isinstance(it, dict) and it.get("type") in ("input_image", "output_image"):
-            out.append("[image]")
-    return "\n".join(out)
-
-def _codex_content_blocks(content):
-    blocks = []
-    for it in content if isinstance(content, list) else []:
-        if not isinstance(it, dict):
-            continue
-        if isinstance(it.get("text"), str) and it["text"]:
-            blocks.append({"type": "text", "text": it["text"]})
-        elif it.get("type") == "input_image":
-            url = it.get("image_url") or ""
-            m = re.match(r"data:([\w/+.-]+);base64,(.*)$", url, re.S)
-            if m:
-                blocks.append({"type": "image", "source": {"type": "base64",
-                               "media_type": m.group(1), "data": m.group(2)}})
-            else:
-                blocks.append({"type": "text", "text": f"[image: {url or it.get('file_id', '')}]"})
-    return blocks
-
-def _codex_output(out):
-    """(text, is_error) of a function/custom tool output. The rollout does not record
-    success; older shell outputs are JSON with metadata.exit_code, which is used if present."""
-    text = _codex_text(out)
-    try:
-        d = json.loads(text) if text.lstrip().startswith("{") else None
-    except ValueError:
-        d = None
-    if isinstance(d, dict) and isinstance(d.get("output"), str):
-        code = (d.get("metadata") or {}).get("exit_code")
-        return d["output"], isinstance(code, int) and code != 0
-    return text, False
-
-def adapt_codex(recs):
-    """Codex CLI rollout (~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl[.zst]).
-
-    Lines are {timestamp, type, payload}. response_item payloads carry the conversation;
-    event_msg lines duplicate it for the UI and are skipped; `compacted` carries the
-    compaction summary.
-    """
-    out, cwd, model, turn, n_anon = [], None, None, 0, 0
-    asst_open = False
-
-    def emit(rtype, ts, msg=None, **extra):
-        rec = {"type": rtype, "timestamp": ts, **extra}
-        if cwd:
-            rec["cwd"] = cwd
-        if msg is not None:
-            rec["message"] = msg
-        out.append(rec)
-
-    def asst(ts, blocks):
-        nonlocal turn, asst_open
-        if not asst_open:
-            turn += 1
-            asst_open = True
-        msg = {"id": f"codex-{turn}", "content": blocks}
-        if model:
-            msg["model"] = model
-        emit("assistant", ts, msg)
-
-    for r in recs:
-        if not isinstance(r, dict):
-            continue
-        typ, ts, pl = r.get("type"), r.get("timestamp"), r.get("payload")
-        if not isinstance(pl, dict):
-            continue
-        if typ in ("session_meta", "turn_context"):
-            cwd = pl.get("cwd") if isinstance(pl.get("cwd"), str) else cwd
-            model = pl.get("model") if isinstance(pl.get("model"), str) else model
-            continue
-        if typ == "compacted":
-            asst_open = False
-            emit("system", ts, subtype="compact_boundary")
-            emit("user", ts, {"content": pl.get("message") or ""}, isCompactSummary=True)
-            continue
-        if typ != "response_item":
-            continue
-        it = pl.get("type")
-        if it == "message":
-            role = pl.get("role")
-            blocks = _codex_content_blocks(pl.get("content"))
-            if not blocks:
-                continue
-            if role == "assistant":
-                asst(ts, blocks)
-            elif role in ("developer", "system"):
-                asst_open = False
-                emit("system", ts, content="\n".join(b.get("text", "") for b in blocks))
-            else:
-                asst_open = False
-                emit("user", ts, {"content": blocks})
-        elif it == "reasoning":
-            text = "\n".join(_codex_text(pl.get(k)) for k in ("summary", "content") if pl.get(k))
-            if text.strip():
-                asst(ts, [{"type": "thinking", "thinking": text}])
-            elif pl.get("encrypted_content"):
-                asst(ts, [{"type": "redacted_thinking"}])
-        elif it in ("function_call", "custom_tool_call", "local_shell_call",
-                    "web_search_call", "tool_search_call"):
-            cid = pl.get("call_id") or pl.get("id")
-            if not cid:
-                n_anon += 1
-                cid = f"codex-call-{n_anon}"
-            if it == "function_call":
-                name = pl.get("name") or "function"
-                if pl.get("namespace"):
-                    name = f"{pl['namespace']}.{name}"
-                inp = _args_dict(pl.get("arguments"))
-            elif it == "custom_tool_call":
-                name, inp = pl.get("name") or "custom_tool", _args_dict(pl.get("input"))
-            elif it == "local_shell_call":
-                name, inp = "local_shell", pl.get("action") or {}
-            elif it == "web_search_call":
-                name, inp = "web_search", pl.get("action") or {}
-            else:
-                name, inp = "tool_search", _args_dict(pl.get("arguments"))
-            asst(ts, [{"type": "tool_use", "id": cid, "name": name, "input": inp}])
-        elif it in ("function_call_output", "custom_tool_call_output", "tool_search_output"):
-            asst_open = False
-            text, err = _codex_output(pl.get("output"))
-            emit("user", ts, {"content": [{"type": "tool_result", "tool_use_id": pl.get("call_id") or "",
-                                           "content": text, "is_error": err}]})
-        elif it == "image_generation_call":
-            asst(ts, [{"type": "text", "text": f"[image generation] {pl.get('revised_prompt') or ''}".strip()}])
-        elif it == "agent_message":
-            asst_open = False
-            emit("system", ts, content=f"[agent message {pl.get('author', '?')} -> "
-                                       f"{pl.get('recipient', '?')}] {_codex_text(pl.get('content'))}")
-    return out
-
 ADAPTERS = {
     "claude-code": (adapt_claude, CLAUDE_CODE),
-    "codex": (adapt_codex, CODEX),
-    "gemini-cli": (adapt_gemini, GEMINI_CLI),
     "chat": (adapt_chat, GENERIC),
 }
 
@@ -1840,14 +1517,14 @@ def _ops_str(ops):
             runs.append([key, 1])
     return ", ".join(k + (f" x{c}" if c > 1 else "") for k, c in runs)
 
-_LOG_EXTS = (".jsonl", ".json", ".jsonl.zst")
+_LOG_EXTS = (".jsonl", ".json")
 _log_index_cache = {}
 
 def find_agent_logs(base_dir, agent_ids, max_depth=3):
     """Map agent id -> log file path, for logs under base_dir whose file name contains the id.
 
-    Harness-neutral: Claude Code (<session>/subagents/agent-<id>.jsonl) and Gemini CLI
-    (chats/<parent>/<id>.jsonl) both name subagent logs after the agent id.
+    Claude Code names subagent logs after the agent id (<session>/subagents/agent-<id>.jsonl);
+    any log whose file name contains the id is accepted.
     """
     if not agent_ids:
         return {}
@@ -2196,10 +1873,7 @@ def compile_pass(input_path, output_dir=None, truncate=128, truncate_user=256,
     if output_dir is None:
         output_dir = os.path.dirname(os.path.abspath(input_path)) or "."
     os.makedirs(output_dir, exist_ok=True)
-    base = os.path.basename(input_path)
-    if base.endswith(".zst"):
-        base = base[:-4]
-    base = os.path.splitext(base)[0]
+    base = os.path.splitext(os.path.basename(input_path))[0]
 
     recs, profile, _ = load(input_path, harness)
     recs = merge_chunks(recs)
@@ -2314,7 +1988,7 @@ def main():
                    help="with --grep: order hits by BM25 relevance to the pattern's words "
                         "instead of newest first (use an alternation of synonyms as the query)")
     p.add_argument("--harness", default="auto",
-                   choices=["auto", "claude-code", "codex", "gemini-cli", "chat"],
+                   choices=["auto", "claude-code", "chat"],
                    help="log format (default: detect per file). 'chat' = JSONL of "
                         "{role, content, tool_calls?} messages, for any other harness")
     p.add_argument("--graph", action="store_true",
