@@ -293,20 +293,24 @@ class TestGraph(VCCTestCase):
     def test_subagent_links(self):
         # Claude Code layout: the parent's tool result carries toolUseResult.agentId and
         # the subagent's log lives in <session>/subagents/agent-<id>.jsonl
-        recs = _records()[:5] + [
+        # real Claude Code records carry sessionId/parentUuid; without them the log would be
+        # read by the universal reader, which does not know Claude Code's toolUseResult
+        recs = [dict(r, sessionId="s1", parentUuid=None) for r in _records()[:5]] + [
             {"type": "assistant", "timestamp": "2026-04-01T09:01:00Z",
-             "message": {"id": "m9", "content": [{"type": "tool_use", "id": "toolu_0000000agent",
+             "message": {"id": "m9", "usage": {"input_tokens": 10, "output_tokens": 5},
+                         "content": [{"type": "tool_use", "id": "toolu_0000000agent",
                                                   "name": "Agent", "input": {"description": "Audit pets",
                                                                              "prompt": "..."}}]}},
             {"type": "user", "timestamp": "2026-04-01T09:02:00Z",
-             "toolUseResult": {"agentId": "abc123def", "status": "completed"},
+             "sessionId": "s1", "parentUuid": None,
+             "toolUseResult": {"agentId": "abc123def", "status": "completed", "totalTokens": 1234},
              "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_0000000agent",
                                       "content": "Audit done."}]}}]
         _write_jsonl(self.jsonl, recs)
         sub_dir = os.path.join(self.dir, "session", "subagents")
         os.makedirs(sub_dir)
         sub = os.path.join(sub_dir, "agent-abc123def.jsonl")
-        _write_jsonl(sub, [{"type": "user", "agentId": "abc123def", "isSidechain": True,
+        _write_jsonl(sub, [{"type": "user", "agentId": "abc123def", "isSidechain": True, "sessionId": "s1",
                             "timestamp": "2026-04-01T09:01:01Z",
                             "message": {"content": "Audit pets"}}])
         self.compile(graph=True)
@@ -314,6 +318,9 @@ class TestGraph(VCCTestCase):
         self.assertIn("1 subagent(s)", graph)
         self.assertRegex(graph, r"  subagent abc123def \(result session\.txt:\d+\) -> "
                                 r".*session/subagents/agent-abc123def\.jsonl")
+        self.assertEqual(VCC.load(self.jsonl)[2], "claude-code")
+        with open(os.path.join(self.dir, "session.txt")) as f:
+            self.assertIn("Subagents:\n  total: 1,234", f.read())        # stats footer
         VCC.compile_pass(sub, quiet=True, graph=True)
         with open(os.path.join(sub_dir, "agent-abc123def.graph.txt")) as f:
             self.assertIn("This log is subagent abc123def.", f.read())
@@ -466,6 +473,102 @@ class TestChatAdapter(VCCTestCase):
         self.assertIn("[tool] write_file:call_1", full)
         self.assertIn("M util.py", "\n".join(self.read("session.files.txt")))
         self.assertIn('"Fix the bug in util.py"', "\n".join(self.read("session.graph.txt")))
+
+
+class TestUniversalReader(VCCTestCase):
+    """The same conversation written in each public LLM API message format must compile to
+    the same turns, tool calls, results and files."""
+
+    ARGS = {"file_path": "/w/app.py", "content": "x = 2\n"}
+
+    DIALECTS = {
+        "anthropic": [
+            {"role": "user", "content": "Set x to 2 in app.py", "timestamp": "2026-06-01T10:00:00Z", "cwd": "/w"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "Overwrite the file."},
+                {"type": "tool_use", "id": "c1", "name": "write_file", "input": ARGS}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "c1", "content": "ok"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "Done."}]},
+        ],
+        "openai_chat": [
+            {"role": "system", "content": "You are a coding agent."},
+            {"role": "user", "content": "Set x to 2 in app.py", "timestamp": "2026-06-01T10:00:00Z", "cwd": "/w"},
+            {"role": "assistant", "content": None, "reasoning_content": "Overwrite the file.",
+             "tool_calls": [{"id": "c1", "type": "function",
+                             "function": {"name": "write_file", "arguments": json.dumps(ARGS)}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            {"role": "assistant", "content": "Done."},
+        ],
+        "openai_responses": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Set x to 2 in app.py"}],
+             "timestamp": "2026-06-01T10:00:00Z", "cwd": "/w"},
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "Overwrite the file."}]},
+            {"type": "function_call", "call_id": "c1", "name": "write_file", "arguments": json.dumps(ARGS)},
+            {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Done."}]},
+        ],
+        "gemini": [
+            {"role": "user", "parts": [{"text": "Set x to 2 in app.py"}], "timestamp": "2026-06-01T10:00:00Z",
+             "cwd": "/w"},
+            {"role": "model", "parts": [{"text": "Overwrite the file.", "thought": True},
+                                        {"functionCall": {"name": "write_file", "args": ARGS}}]},
+            {"role": "user", "parts": [{"functionResponse": {"name": "write_file",
+                                                             "response": {"output": "ok"}}}]},
+            {"role": "model", "parts": [{"text": "Done."}]},
+        ],
+    }
+
+    def compile_dialect(self, name):
+        _write_jsonl(self.jsonl, self.DIALECTS[name])
+        self.assertEqual(VCC.load(self.jsonl)[2], "chat")
+        self.compile(graph=True)
+        return ("\n".join(self.read("session.txt")), "\n".join(self.read("session.files.txt")),
+                "\n".join(self.read("session.graph.txt")))
+
+    def test_every_dialect_gives_the_same_conversation(self):
+        for name in self.DIALECTS:
+            with self.subTest(dialect=name):
+                full, files, graph = self.compile_dialect(name)
+                self.assertIn("[user] 2026-06-01 10:00Z\n\nSet x to 2 in app.py", full)
+                self.assertIn(">>>thinking\nOverwrite the file.\n<<<thinking", full)
+                self.assertRegex(full, r">>>tool_call write_file:\w+\nfile_path: /w/app.py")
+                self.assertRegex(full, r"\[tool\] write_file:\w+\n\nok")
+                self.assertIn("Done.", full)
+                self.assertIn("M app.py", files)
+                self.assertIn('T1 2026-06-01 10:00Z', graph)
+                self.assertIn("M app.py: write_file", graph)
+
+    def test_reasoning_and_call_are_one_assistant_turn(self):
+        full, _, _ = self.compile_dialect("openai_responses")
+        self.assertRegex(full, r"\[assistant\]\n\n>>>thinking\nOverwrite the file.\n<<<thinking\n\n>>>tool_call")
+
+    def test_envelopes_and_documents(self):
+        # {"type": role, "message": {...}} envelopes, and a whole-file {"messages": [...]} document
+        _write_jsonl(self.jsonl, [{"type": "user", "timestamp": "2026-06-01T10:00:00Z",
+                                   "message": {"content": "hello there"}}])
+        self.compile()
+        self.assertIn("[user] 2026-06-01 10:00Z\n\nhello there", "\n".join(self.read("session.txt")))
+        with open(self.jsonl, "w") as f:
+            json.dump({"messages": self.DIALECTS["openai_chat"]}, f, indent=2)
+        self.compile()
+        self.assertIn("Done.", "\n".join(self.read("session.txt")))
+
+    def test_gemini_errors_and_ids(self):
+        _write_jsonl(self.jsonl, [
+            {"role": "user", "parts": [{"text": "run it"}]},
+            {"role": "model", "parts": [{"functionCall": {"id": "g1", "name": "shell", "args": {"command": "make"}}}]},
+            {"role": "user", "parts": [{"functionResponse": {"id": "g1", "name": "shell",
+                                                             "response": {"error": "make: *** failed"}}}]},
+        ])
+        self.compile()
+        self.assertIn("[tool_error] shell:g1\n\nmake: *** failed", "\n".join(self.read("session.txt")))
+
+    def test_claude_code_is_detected_only_by_its_own_markers(self):
+        _write_jsonl(self.jsonl, [{"type": "user", "sessionId": "s", "parentUuid": None,
+                                   "message": {"role": "user", "content": "hi"}}])
+        self.assertEqual(VCC.load(self.jsonl)[2], "claude-code")
+        _write_jsonl(self.jsonl, [{"type": "user", "message": {"role": "user", "content": "hi"}}])
+        self.assertEqual(VCC.load(self.jsonl)[2], "chat")
 
 
 class TestCLI(VCCTestCase):

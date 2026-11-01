@@ -21,27 +21,27 @@ There is also a [paper](https://arxiv.org/abs/2603.29678) showing that VCC impro
 
 # Install
 
-Currently We support Claude Code only. In this fork the compiler also reads generic role/content chat JSONL (`--harness chat`), which other agents' logs can be converted to.
+VCC is not tied to one agent. The compiler (`skills/conversation-compiler/scripts/VCC.py`, Python 3.10+, no dependencies) reads conversations in any public LLM API message format (Anthropic Messages, OpenAI Chat Completions, OpenAI Responses, Gemini contents) as JSONL, and Claude Code session logs directly. The skills are plain `SKILL.md` folders for agents that load skills; see INSTALL.md.
 
-To install, copy this to your Claude Code:
+To install, copy this to your coding agent:
 
     Please help me install the skills from 
     https://github.com/lllyasviel/VCC.git 
     just clone it then follow the INSTALL.md
 
-To update, copy this to your Claude Code:
+To update, copy this to your coding agent:
 
     Please help me update the skills from
     https://github.com/lllyasviel/VCC.git
     just clone it then follow the INSTALL.md
 
-To uninstall, copy this to your Claude Code:
+To uninstall, copy this to your coding agent:
 
     Please help me uninstall VCC skills by deleting
     `conversation-compiler`, `readchat`, `recall`, `searchchat`
-    from my `.claude/skills`
+    from my skills directory
 
-Restart Claude Code after install, update, or uninstall.
+Restart your agent after install, update, or uninstall.
 
 # Basic Usage
 
@@ -249,7 +249,7 @@ The adaptive view keeps conversation order so it is good for understanding conte
 
 ## Additions in this fork
 
-* **Harness-neutral core**: tool calls are understood from argument shapes (path / content / patch / command arguments), not tool names, and Claude Code's noise rules live in one profile applied at parse time, so every view and lowering pass is harness-neutral. Besides Claude Code JSONL, a generic role/content chat JSONL input (`--harness chat`, auto-detected) is supported.
+* **Agent-neutral input**: one universal reader for the public LLM API message formats (Anthropic Messages, OpenAI Chat Completions, OpenAI Responses items, Gemini contents), one message per line, auto-detected; Claude Code session logs are read directly. Tool calls are understood from argument shapes (path / content / patch / command arguments), not tool names, and each source's noise rules are applied once at parse time, so every view and lowering pass is agent-neutral.
 * **Timestamps**: `[user]` headers and every `--grep` hit show the UTC time (`[user] 2026-04-02 10:31Z`).
 * **Search filters**: `--role tool_error`, `--since 2026-04-01`, `--until 2026-04-30`, `--limit 30`. They apply to both the stdout hits and `.view.txt`. `--grep . --role tool_error` lists every failed tool call.
 * **Files view** (`.files.txt`): every file the conversation read or modified, newest first, with `(call, result)` pointers into the full view. `/recall` uses it as the checklist of files to re-read. Writes done through shell commands (redirections, `tee`, `sed -i`, `mv`, `cp`, `rm`, `touch`, `git checkout/restore`…) are inferred conservatively and marked `~`; heredoc bodies, variables and globs are never guessed.

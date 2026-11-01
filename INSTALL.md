@@ -6,21 +6,23 @@
 
 ## Install
 
-Clone this repo to any temporary location. Copy the four folders inside `skills/` (`conversation-compiler`, `readchat`, `recall`, `searchchat`) into your project's `.claude/skills/`. Delete the cloned repo.
+Clone this repo to any temporary location. Copy the four folders inside `skills/` (`conversation-compiler`, `readchat`, `recall`, `searchchat`) into the directory your agent loads skills from (Claude Code: your project's `.claude/skills/`). Keep the four folders side by side: the skills refer to each other by relative path. Delete the cloned repo.
+
+Agents without skill support can use the compiler directly: `python skills/conversation-compiler/scripts/VCC.py <log> ...` (see `skills/conversation-compiler/SKILL.md` for the workflow).
 
 ## Update
 
-Clone this repo to any temporary location. Delete the four folders (`conversation-compiler`, `readchat`, `recall`, `searchchat`) from your `.claude/skills/`, then copy the new versions from the cloned `skills/` into `.claude/skills/`. Delete the cloned repo.
+Clone this repo to any temporary location. Delete the four folders (`conversation-compiler`, `readchat`, `recall`, `searchchat`) from your skills directory, then copy the new versions from the cloned `skills/` into it. Delete the cloned repo.
 
 ## Keeping your history (recommended)
 
-VCC can only read logs that still exist. By default Claude Code **deletes logs older than 30 days** at startup (`cleanupPeriodDays`, default 30). To search further back, raise it in `~/.claude/settings.json`:
+VCC can only read logs that still exist. Check whether your agent deletes old logs. For example, Claude Code **deletes logs older than 30 days** at startup (`cleanupPeriodDays`, default 30). To search further back, raise it in `~/.claude/settings.json`:
 
 ```json
 { "cleanupPeriodDays": 3650 }
 ```
 
-Alternatively (or additionally), `vcc_hook.py --sweep` mirrors a log directory into an archive (log files only, copied only when newer; it never deletes anything). Run it from cron, e.g. hourly:
+For any agent, `vcc_hook.py --sweep` mirrors a log directory into an archive (log files only, copied only when newer; it never deletes anything). Run it from cron, e.g. hourly:
 
 ```
 0 * * * * python3 /path/to/conversation-compiler/scripts/vcc_hook.py --archive ~/agent-log-archive --sweep ~/.claude/projects
@@ -28,7 +30,7 @@ Alternatively (or additionally), `vcc_hook.py --sweep` mirrors a log directory i
 
 Search the archive like any log directory.
 
-## Optional hooks (Claude Code)
+## Optional hooks (example: Claude Code)
 
 `scripts/vcc_hook.py` (inside `conversation-compiler`) can run as a Claude Code hook. It never blocks or fails Claude Code: errors go to stderr and it always exits 0.
 
@@ -56,8 +58,8 @@ Only add these hooks if the user asks for them.
 
 ## Verify
 
-After install or update, ask the user to restart Claude Code, then run `/recall` to test that everything works.
+After install or update, ask the user to restart the agent, then run `/recall` to test that everything works.
 
 ## Uninstall
 
-Delete `conversation-compiler`, `readchat`, `recall`, `searchchat` from your `.claude/skills/`. Ask the user to restart Claude Code.
+Delete `conversation-compiler`, `readchat`, `recall`, `searchchat` from your skills directory. Ask the user to restart the agent.

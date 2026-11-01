@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """View-oriented Conversation Compiler (VCC) - compile coding-agent logs into adaptive views.
 
-Input: Claude Code session logs, or generic role/content chat JSONL that any other agent's
-log can be converted to (detected per file; --harness to override). See "input adapters".
+Input: conversations in any public LLM API message format (Anthropic Messages, OpenAI Chat
+Completions, OpenAI Responses items, Gemini contents), one message per line; Claude Code
+session logs are read directly. Detected per file (--harness to override); see "input adapters".
 
 Produces per conversation chain:
   .txt       Full transcript (lossless rendering of JSONL)
@@ -117,8 +118,6 @@ def match_lines(lines, regex, ref_fn="x.txt", start_line=1):
 # ── lexer ──
 
 SEP = "══════════════════════════════"
-_DISCARD_T = {"queue-operation", "file-history-snapshot", "last-prompt", "progress"}
-_DISCARD_S = {"stop_hook_summary", "api_error", "bridge_status", "informational", "local_command"}
 
 def _short(fn):
     n, e = os.path.splitext(fn)
@@ -190,13 +189,9 @@ def _collect_stats(chain):
             for b in content:
                 if isinstance(b, dict) and b.get("type") == "tool_use":
                     tool_uses += 1
-        # subagent usage from toolUseResult
-        tur = r.get("toolUseResult")
-        if isinstance(tur, dict) and tur.get("agentId"):
-            try:
-                subagent_tokens += int(tur.get("totalTokens", 0))
-            except (ValueError, TypeError):
-                pass
+        # tokens used by subagents this record reports (set by the input adapter)
+        if isinstance(r.get("subagent_tokens"), int):
+            subagent_tokens += r["subagent_tokens"]
     duration = None
     if len(timestamps) >= 2:
         try:
@@ -261,10 +256,6 @@ def _preprocess_tool_text(text, tool_name, profile=None):
     text = _sanitize(text)
     return profile.fix_result(tool_name, text) if profile is not None else text
 
-def _discard(r):
-    t = r.get("type")
-    return t in _DISCARD_T or (t == "system" and r.get("subtype") in _DISCARD_S)
-
 def merge_chunks(recs):
     merged = []
     active_mid = None
@@ -287,15 +278,13 @@ def merge_chunks(recs):
                     active_idx = None
         else:
             merged.append(r)
-            if not _discard(r):
-                active_mid = None
-                active_idx = None
+            active_mid = None
+            active_idx = None
     return merged
 
 def split_chains(recs):
-    kept = [r for r in recs if not _discard(r)]
     chains, cur = [], []
-    for r in kept:
+    for r in recs:
         if r.get("type") == "system" and r.get("subtype") == "compact_boundary":
             if cur: chains.append(cur)
             cur = []
@@ -410,14 +399,14 @@ def load_records(path):
     return []
 
 def detect_harness(recs):
-    """Name of the adapter for these records: claude-code or chat."""
+    """Name of the adapter for these records: claude-code (its own log files) or chat
+    (the universal reader for LLM API message formats)."""
     dicts = [r for r in recs[:200] if isinstance(r, dict)]
-    if any(r.get("type") in ("user", "assistant", "system") and isinstance(r.get("message"), dict)
-           for r in dicts) or any(r.get("type") in _DISCARD_T for r in dicts):
+    if any(r.get("type") in _CLAUDE_DISCARD_T for r in dicts) or any(
+            r.get("type") in ("user", "assistant") and isinstance(r.get("message"), dict)
+            and ("sessionId" in r or "parentUuid" in r) for r in dicts):
         return "claude-code"
-    if any("role" in r for r in dicts) or any(isinstance(r.get("messages"), list) for r in dicts):
-        return "chat"
-    return "claude-code"
+    return "chat"
 
 def _json_text(v):
     if isinstance(v, str):
@@ -466,31 +455,141 @@ def _chat_blocks(content):
                 out.append(b)
             elif t in ("reasoning", "reasoning_text", "summary_text"):
                 out.append({"type": "thinking", "thinking": b.get("text", "")})
+            elif t in ("image_url", "input_image"):
+                out.append({"type": "text", "text": "[image]"})
+            elif t == "refusal":
+                out.append({"type": "text", "text": b.get("refusal", "")})
             else:
                 out.append({"type": "text", "text": _json_text(b)})
     return out
 
-def adapt_chat(recs):
-    msgs = []
+def _iter_messages(recs):
+    """(message, envelope) pairs. A line may be a message, {"messages": [...]}, or an
+    envelope {"message": {...}, "timestamp"?, "type"?: role, ...}; a whole-file JSON
+    array or {"messages": [...]} document works too."""
     for r in recs:
-        if isinstance(r, dict) and isinstance(r.get("messages"), list):
-            msgs.extend(m for m in r["messages"] if isinstance(m, dict))
-        elif isinstance(r, dict):
-            msgs.append(r)
-    out = []
-    for m in msgs:
-        role = _CHAT_ROLE.get(str(m.get("role", "")).lower())
-        ts = m.get("timestamp") or m.get("created_at") or m.get("time")
-        base = {"timestamp": ts if isinstance(ts, str) else None}
-        if isinstance(m.get("cwd"), str):
-            base["cwd"] = m["cwd"]
-        if m.get("role") in ("tool", "function"):
-            out.append({**base, "type": "user", "message": {"content": [{
-                "type": "tool_result", "tool_use_id": m.get("tool_call_id") or m.get("name", ""),
-                "content": _json_text(m.get("content", "")), "is_error": bool(m.get("is_error"))}]}})
+        if not isinstance(r, dict):
             continue
+        if isinstance(r.get("messages"), list):
+            for m in r["messages"]:
+                if isinstance(m, dict):
+                    yield m, r
+        elif isinstance(r.get("message"), dict) and "role" not in r and "parts" not in r:
+            m = dict(r["message"])
+            if "role" not in m and r.get("type") in _CHAT_ROLE:
+                m["role"] = r["type"]
+            yield m, r
+        else:
+            yield r, r
+
+_RESPONSE_ITEM_TYPES = {"message", "reasoning", "function_call", "custom_tool_call"}
+
+def _texts(items):
+    """Text of a content value: string, or a list of {text}/{type: *_text} items."""
+    if isinstance(items, str):
+        return items
+    out = []
+    for it in items if isinstance(items, list) else []:
+        if isinstance(it, str):
+            out.append(it)
+        elif isinstance(it, dict) and isinstance(it.get("text"), str):
+            out.append(it["text"])
+    return "\n".join(out)
+
+def adapt_chat(recs):
+    """Universal reader: one conversation in any of the public LLM API message formats.
+
+    Per message (mixing formats in one file is fine):
+      Anthropic Messages     {role, content: str | [text|thinking|tool_use|tool_result|image]}
+      OpenAI Chat            {role, content, tool_calls: [{id, function: {name, arguments}}]},
+                             {role: "tool", tool_call_id, content}
+      OpenAI Responses items {type: message|reasoning|function_call|function_call_output|
+                              custom_tool_call|custom_tool_call_output, ...}
+      Gemini contents        {role: user|model, parts: [{text}|{text, thought}|{functionCall}|
+                              {functionResponse}]}
+    Optional per message or envelope: timestamp (ISO-8601), cwd, id.
+    """
+    out, n_ids, pending = [], 0, {}      # pending: tool name -> [generated ids] (Gemini w/o ids)
+
+    def emit(rtype, m, env, content, mid=None):
+        ts = m.get("timestamp") or env.get("timestamp") or m.get("created_at") or env.get("time")
+        rec = {"type": rtype, "timestamp": ts if isinstance(ts, str) else None,
+               "message": {"id": mid, "content": content}}
+        if m.get("type") in _RESPONSE_ITEM_TYPES:
+            rec["_item"] = True       # one piece of a single model response
+        cwd = m.get("cwd") or env.get("cwd")
+        if isinstance(cwd, str):
+            rec["cwd"] = cwd
+        out.append(rec)
+
+    def result(m, env, call_id, body, err=False):
+        emit("user", m, env, [{"type": "tool_result", "tool_use_id": call_id or "",
+                               "content": _json_text(body) if not isinstance(body, str) else body,
+                               "is_error": bool(err)}])
+
+    for m, env in _iter_messages(recs):
+        t, role_raw = m.get("type"), str(m.get("role", "")).lower()
+        # OpenAI Responses API items
+        if t in ("function_call", "custom_tool_call"):
+            n_ids += 1
+            emit("assistant", m, env, [{"type": "tool_use", "id": m.get("call_id") or m.get("id") or f"call_{n_ids}",
+                                        "name": m.get("name") or "tool",
+                                        "input": _args_dict(m.get("arguments", m.get("input")))}])
+            continue
+        if t in ("function_call_output", "custom_tool_call_output"):
+            out_v = m.get("output")
+            result(m, env, m.get("call_id"), _texts(out_v) if isinstance(out_v, list) else out_v)
+            continue
+        if t == "reasoning":
+            text = "\n".join(_texts(m.get(k)) for k in ("summary", "content") if m.get(k))
+            if text.strip():
+                emit("assistant", m, env, [{"type": "thinking", "thinking": text}])
+            continue
+        # tool results as messages (OpenAI Chat role "tool"/"function")
+        if role_raw in ("tool", "function") and "parts" not in m:
+            result(m, env, m.get("tool_call_id") or m.get("name"), m.get("content", ""), m.get("is_error"))
+            continue
+        role = _CHAT_ROLE.get(role_raw) or ("user" if role_raw == "function" else None)
         if role is None:
             continue
+        # Gemini contents
+        if isinstance(m.get("parts"), list):
+            blocks, results = [], []
+            for part in m["parts"]:
+                if not isinstance(part, dict):
+                    continue
+                if isinstance(part.get("text"), str) and part["text"]:
+                    blocks.append({"type": "thinking", "thinking": part["text"]} if part.get("thought")
+                                  else {"type": "text", "text": part["text"]})
+                elif isinstance(part.get("functionCall"), dict):
+                    fc = part["functionCall"]
+                    cid = fc.get("id")
+                    if not cid:
+                        n_ids += 1
+                        cid = f"call_{n_ids}"
+                        pending.setdefault(fc.get("name"), []).append(cid)
+                    blocks.append({"type": "tool_use", "id": cid, "name": fc.get("name") or "tool",
+                                   "input": _args_dict(fc.get("args"))})
+                elif isinstance(part.get("functionResponse"), dict):
+                    fr = part["functionResponse"]
+                    cid = fr.get("id")
+                    if not cid:   # no ids: answer the oldest open call of the same name
+                        open_calls = pending.get(fr.get("name")) or []
+                        cid = open_calls.pop(0) if open_calls else fr.get("name")
+                    resp = fr.get("response")
+                    err = isinstance(resp, dict) and "error" in resp and "output" not in resp
+                    body = resp
+                    if isinstance(resp, dict) and set(resp) <= {"output", "error"}:
+                        body = resp.get("error") if err else resp.get("output")
+                    results.append({"type": "tool_result", "tool_use_id": cid or "",
+                                    "content": body if isinstance(body, str) else _json_text(body),
+                                    "is_error": err})
+            if blocks:
+                emit(role, m, env, blocks, m.get("id"))
+            if results:
+                emit("user", m, env, results)
+            continue
+        # Anthropic / OpenAI Chat / Responses "message" items
         blocks = _chat_blocks(m.get("content"))
         if m.get("reasoning_content"):
             blocks.insert(0, {"type": "thinking", "thinking": m["reasoning_content"]})
@@ -499,22 +598,63 @@ def adapt_chat(recs):
             blocks.append({"type": "tool_use", "id": tc.get("id", ""),
                            "name": fn.get("name") or tc.get("name", "tool"),
                            "input": _args_dict(fn.get("arguments", tc.get("arguments", tc.get("input"))))})
-        out.append({**base, "type": role, "message": {"id": m.get("id"), "content": blocks}})
+        if role == "system":
+            text = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+            if text:
+                out.append({"type": "system", "content": text,
+                            "timestamp": m.get("timestamp") or env.get("timestamp")})
+            continue
+        if blocks:
+            emit(role, m, env, blocks, m.get("id"))
+
+    # Responses items (reasoning, calls, message) of one model response form one assistant
+    # turn; separate chat messages stay separate.
+    prev = None
+    for r in out:
+        msg = r.get("message") or {}
+        if r["type"] == "assistant" and r.pop("_item", False) and not msg.get("id"):
+            if prev is not None:
+                msg["id"] = prev
+            else:
+                n_ids += 1
+                msg["id"] = prev = f"turn-{n_ids}"
+        else:
+            r.pop("_item", None)
+            prev = None
     return out
 
+# -- Claude Code session logs (~/.claude/projects/<project>/*.jsonl) --
+
+_CLAUDE_DISCARD_T = {"queue-operation", "file-history-snapshot", "last-prompt", "progress"}
+_CLAUDE_DISCARD_S = {"stop_hook_summary", "api_error", "bridge_status", "informational",
+                     "local_command"}
+
 def adapt_claude(recs):
-    """Claude Code logs already use the internal model; only the subagent link moves:
-    toolUseResult.agentId (record level) -> agent_id on the tool_result block."""
+    """Claude Code logs are close to the internal model. Drops its bookkeeping records,
+    and moves toolUseResult.agentId / totalTokens (record level) to the tool_result's
+    agent_id and the record's subagent_tokens."""
+    kept = []
     for r in recs:
-        tur = r.get("toolUseResult") if isinstance(r, dict) else None
+        if not isinstance(r, dict):
+            continue
+        t = r.get("type")
+        if t in _CLAUDE_DISCARD_T or (t == "system" and r.get("subtype") in _CLAUDE_DISCARD_S):
+            continue
+        kept.append(r)
+    for r in kept:
+        tur = r.get("toolUseResult")
         if not (isinstance(tur, dict) and isinstance(tur.get("agentId"), str)):
             continue
+        try:
+            r["subagent_tokens"] = int(tur.get("totalTokens", 0))
+        except (ValueError, TypeError):
+            pass
         content = (r.get("message") or {}).get("content")
         trs = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"] \
             if isinstance(content, list) else []
         if len(trs) == 1:
             trs[0]["agent_id"] = tur["agentId"]
-    return recs
+    return kept
 
 ADAPTERS = {
     "claude-code": (adapt_claude, CLAUDE_CODE),
