@@ -21,7 +21,7 @@ There is also a [paper](https://arxiv.org/abs/2603.29678) showing that VCC impro
 
 # Install
 
-The skills install into Claude Code. The compiler itself (`skills/conversation-compiler/scripts/VCC.py`, Python 3.10+, no dependencies) runs standalone on Claude Code, Codex CLI and Gemini CLI logs, or on any harness's log exported as role/content chat JSONL.
+The skills install into Claude Code. The compiler itself (`skills/conversation-compiler/scripts/VCC.py`, Python 3.10+, no dependencies) runs standalone on Claude Code, Codex CLI, Gemini CLI and OpenCode logs, or on any harness's log exported as role/content chat JSONL.
 
 To install, copy this to your Claude Code:
 
@@ -249,7 +249,7 @@ The adaptive view keeps conversation order so it is good for understanding conte
 
 ## Additions in this fork
 
-* **Harness-neutral core**: input adapters for Claude Code, Codex CLI (`rollout-*.jsonl`, also `.jsonl.zst`) and Gemini CLI (`session-*.jsonl` / legacy `.json`), plus a generic role/content chat JSONL adapter for anything else; detected per file (`--harness` to override). Tool calls are understood from argument shapes (path / content / patch arguments), not tool names, and harness noise rules live in per-harness profiles applied once at parse time, so every view and lowering pass is harness-neutral.
+* **Harness-neutral core**: input adapters for Claude Code, Codex CLI (`rollout-*.jsonl`, also `.jsonl.zst`) Gemini CLI (`session-*.jsonl` / legacy `.json`) and OpenCode (its SQLite database, one conversation per session; experimental), plus a generic role/content chat JSONL adapter for anything else; detected per file (`--harness` to override). Tool calls are understood from argument shapes (path / content / patch arguments), not tool names, and harness noise rules live in per-harness profiles applied once at parse time, so every view and lowering pass is harness-neutral.
 * **Timestamps**: `[user]` headers and every `--grep` hit show the UTC time (`[user] 2026-04-02 10:31Z`).
 * **Search filters**: `--role tool_error`, `--since 2026-04-01`, `--until 2026-04-30`, `--limit 30`. They apply to both the stdout hits and `.view.txt`. `--grep . --role tool_error` lists every failed tool call.
 * **Files view** (`.files.txt`): every file the conversation read or modified, newest first, with `(call, result)` pointers into the full view. `/recall` uses it as the checklist of files to re-read. Writes done through shell commands (redirections, `tee`, `sed -i`, `mv`, `cp`, `rm`, `touch`, `git checkout/restore`…) are inferred conservatively and marked `~`; heredoc bodies, variables and globs are never guessed.

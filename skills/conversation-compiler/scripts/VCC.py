@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """View-oriented Conversation Compiler (VCC) - compile coding-agent logs into adaptive views.
 
-Input: Claude Code, Codex CLI and Gemini CLI session logs, or generic role/content chat
+Input: Claude Code, Codex CLI, Gemini CLI and OpenCode (SQLite) session logs, or generic role/content chat
 JSONL (detected per file; --harness to override). See "input adapters" below.
 
 Produces per conversation chain:
@@ -32,6 +32,9 @@ import os
 import re
 import sys
 import glob as globmod
+import shutil
+from collections import defaultdict
+from datetime import datetime, timezone
 
 # ── dict emitter ──
 
@@ -837,6 +840,219 @@ def adapt_codex(recs):
                                        f"{pl.get('recipient', '?')}] {_codex_text(pl.get('content'))}")
     return out
 
+# -- OpenCode (SQLite database under ~/.local/share/opencode/) --
+#
+# One database holds every session, so a database path expands into one virtual input
+# per session: "<db>::<session_id>". Schema (from anomalyco/opencode source): v2 tables
+# session_v2 / session_message (type, seq, data JSON) / session_part (ordinal, type,
+# data JSON); v1 tables session / message / part with JSON in `data`. Shapes the source
+# review could not confirm (tool output content, token fields) are rendered generically.
+
+OPENCODE_PROFILE = Profile("opencode")
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+
+def _is_sqlite(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read(16) == _SQLITE_MAGIC
+    except OSError:
+        return False
+
+def _sqlite_open(path):
+    """Open read-only; if that fails (locked, WAL without write access), read a temp copy."""
+    import sqlite3, pathlib, tempfile
+    try:
+        con = sqlite3.connect(pathlib.Path(os.path.abspath(path)).as_uri() + "?mode=ro", uri=True)
+        con.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+        return con
+    except sqlite3.Error:
+        tmp = tempfile.mkdtemp(prefix="vcc_opencode_")
+        for suffix in ("", "-wal", "-shm"):
+            if os.path.exists(path + suffix):
+                shutil.copy2(path + suffix, os.path.join(tmp, "db" + suffix))
+        return sqlite3.connect(os.path.join(tmp, "db"))
+
+def _tables(con):
+    return {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+
+def opencode_sessions(path):
+    """[(session_id, updated_ms)] of an OpenCode database, oldest first; [] if not one."""
+    if not _is_sqlite(path):
+        return []
+    con = _sqlite_open(path)
+    try:
+        t = _tables(con)
+        if {"session_v2", "session_message"} <= t:
+            rows = con.execute("SELECT id, time_updated FROM session_v2").fetchall()
+        elif {"message", "part"} <= t:
+            rows = con.execute("SELECT session_id, MAX(time_created) FROM message "
+                               "GROUP BY session_id").fetchall()
+        else:
+            return []
+    finally:
+        con.close()
+    return sorted(((sid, upd or 0) for sid, upd in rows), key=lambda r: (r[1], r[0]))
+
+def _ms_iso(v):
+    if isinstance(v, (int, float)) and v > 0:
+        sec = v / 1000.0 if v > 1e11 else float(v)
+        return datetime.fromtimestamp(sec, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return v if isinstance(v, str) else None
+
+def _jload(v):
+    if isinstance(v, (bytes, str)):
+        try:
+            return json.loads(v)
+        except ValueError:
+            return {}
+    return v if isinstance(v, dict) else {}
+
+def _oc_content_text(c):
+    """Tool output content (shape unconfirmed): strings, {text}, or anything else as JSON."""
+    if c is None:
+        return ""
+    if isinstance(c, str):
+        return c
+    if isinstance(c, dict):
+        return c["text"] if isinstance(c.get("text"), str) else _json_text(c)
+    if isinstance(c, list):
+        return "\n".join(_oc_content_text(x) for x in c)
+    return str(c)
+
+def _oc_tool(part_id, name, state):
+    """(tool_use block, tool_result block or None) from an OpenCode tool part state."""
+    state = state if isinstance(state, dict) else {}
+    use = {"type": "tool_use", "id": part_id, "name": name or "tool",
+           "input": _args_dict(state.get("input"))}
+    status = state.get("status")
+    if status == "completed":
+        body = state["output"] if isinstance(state.get("output"), str) else _oc_content_text(state.get("content"))
+        return use, {"type": "tool_result", "tool_use_id": part_id, "content": body}
+    if status == "error":
+        err = state.get("error")
+        body = err if isinstance(err, str) else _json_text(err)
+        extra = _oc_content_text(state.get("content"))
+        return use, {"type": "tool_result", "tool_use_id": part_id, "is_error": True,
+                     "content": body + ("\n" + extra if extra else "")}
+    return use, None
+
+def _oc_assistant(out, ts, cwd, mid, blocks, results, model=None):
+    base = {"timestamp": ts, **({"cwd": cwd} if cwd else {})}
+    if blocks:
+        msg = {"id": mid, "content": blocks}
+        if model:
+            msg["model"] = model
+        out.append({**base, "type": "assistant", "message": msg})
+    if results:
+        out.append({**base, "type": "user", "message": {"content": results}})
+
+def _oc_v2(con, sid):
+    row = con.execute("SELECT directory, parent_id FROM session_v2 WHERE id=?", (sid,)).fetchone()
+    cwd, parent = (row if row else (None, None))
+    parts = defaultdict(list)
+    for mid, ptype, call_id, data in con.execute(
+            "SELECT message_id, type, call_id, data FROM session_part WHERE session_id=? "
+            "ORDER BY message_id, ordinal", (sid,)):
+        d = _jload(data)
+        d.setdefault("type", ptype)
+        if call_id and not d.get("id"):
+            d["id"] = call_id
+        parts[mid].append(d)
+    out = []
+    for mid, mtype, created, data in con.execute(
+            "SELECT id, type, time_created, data FROM session_message WHERE session_id=? "
+            "ORDER BY seq", (sid,)):
+        d = _jload(data)
+        ts = _ms_iso(created) or _ms_iso((d.get("time") or {}).get("created"))
+        base = {"timestamp": ts, **({"cwd": cwd} if cwd else {})}
+        if mtype == "user":
+            text = d.get("text") if isinstance(d.get("text"), str) else _json_text(d.get("text", ""))
+            if text:
+                out.append({**base, "type": "user", "message": {"content": text}})
+        elif mtype == "assistant":
+            blocks, results = [], []
+            for pt in parts.get(mid) or d.get("content") or []:
+                t = pt.get("type")
+                if t == "text" and pt.get("text"):
+                    blocks.append({"type": "text", "text": pt["text"]})
+                elif t == "reasoning" and pt.get("text"):
+                    blocks.append({"type": "thinking", "thinking": pt["text"]})
+                elif t == "tool":
+                    use, res = _oc_tool(pt.get("id", ""), pt.get("name"), pt.get("state"))
+                    blocks.append(use)
+                    if res:
+                        results.append(res)
+            model = (d.get("model") or {}).get("id") if isinstance(d.get("model"), dict) else None
+            _oc_assistant(out, ts, cwd, mid, blocks, results, model)
+            if d.get("error"):
+                out.append({**base, "type": "system", "content": f"[error] {_json_text(d['error'])}"})
+        elif mtype == "compaction":
+            if d.get("status", "completed") == "completed" and d.get("summary"):
+                out.append({**base, "type": "system", "subtype": "compact_boundary"})
+                out.append({**base, "type": "user", "isCompactSummary": True,
+                            "message": {"content": d["summary"]}})
+        elif mtype in ("synthetic", "system", "skill", "shell"):
+            text = d.get("text") if isinstance(d.get("text"), str) else _json_text(d)
+            out.append({**base, "type": "system", "content": f"[{mtype}] {text}"})
+    if parent:
+        for r in out:
+            r["agentId"] = sid
+    return out
+
+def _oc_v1(con, sid):
+    parts = defaultdict(list)
+    for pid, mid, data in con.execute("SELECT id, message_id, data FROM part WHERE session_id=?", (sid,)):
+        parts[mid].append((pid, _jload(data)))
+    msgs = sorted(con.execute("SELECT id, time_created, data FROM message WHERE session_id=?", (sid,)),
+                  key=lambda r: (r[1] or 0, r[0]))
+    out, cwd = [], None
+    for mid, created, data in msgs:
+        d = _jload(data)
+        cwd = ((d.get("path") or {}).get("cwd") if isinstance(d.get("path"), dict) else None) or cwd
+        ts = _ms_iso(created) or _ms_iso((d.get("time") or {}).get("created"))
+        base = {"timestamp": ts, **({"cwd": cwd} if cwd else {})}
+        ps = [p for _, p in sorted(parts.get(mid, []), key=lambda x: x[0])]
+        if d.get("role") == "user":
+            if any(p.get("type") == "compaction" for p in ps):
+                out.append({**base, "type": "system", "subtype": "compact_boundary"})
+                continue
+            texts = [p.get("text", "") for p in ps if p.get("type") == "text" and not p.get("synthetic")]
+            synth = [p.get("text", "") for p in ps if p.get("type") == "text" and p.get("synthetic")]
+            if any(texts):
+                out.append({**base, "type": "user", "message": {"content": "\n".join(t for t in texts if t)}})
+            for t in synth:
+                if t:
+                    out.append({**base, "type": "system", "content": f"[synthetic] {t}"})
+        elif d.get("role") == "assistant":
+            if d.get("summary") is True:     # compaction summary message
+                text = "\n\n".join(p.get("text", "") for p in ps if p.get("type") == "text")
+                out.append({**base, "type": "user", "isCompactSummary": True, "message": {"content": text}})
+                continue
+            blocks, results = [], []
+            for p in ps:
+                t = p.get("type")
+                if t == "text" and p.get("text"):
+                    blocks.append({"type": "text", "text": p["text"]})
+                elif t == "reasoning" and p.get("text"):
+                    blocks.append({"type": "thinking", "thinking": p["text"]})
+                elif t == "tool":
+                    use, res = _oc_tool(p.get("callID", ""), p.get("tool"), p.get("state"))
+                    blocks.append(use)
+                    if res:
+                        results.append(res)
+            _oc_assistant(out, ts, cwd, mid, blocks, results, d.get("modelID"))
+            if d.get("error"):
+                out.append({**base, "type": "system", "content": f"[error] {_json_text(d['error'])}"})
+    return out
+
+def load_opencode(db, sid):
+    con = _sqlite_open(db)
+    try:
+        t = _tables(con)
+        return _oc_v2(con, sid) if "session_v2" in t else _oc_v1(con, sid)
+    finally:
+        con.close()
+
 ADAPTERS = {
     "claude-code": (adapt_claude, CLAUDE_CODE),
     "codex": (adapt_codex, CODEX),
@@ -846,6 +1062,12 @@ ADAPTERS = {
 
 def load(path, harness="auto"):
     """Read any supported log and return (records in the internal model, profile, harness)."""
+    db, sep, sid = path.rpartition("::")
+    if sep and harness in ("auto", "opencode") and _is_sqlite(db):
+        return load_opencode(db, sid), OPENCODE_PROFILE, "opencode"
+    if harness == "opencode":
+        raise SystemExit(f"{path}: an OpenCode input is a database (pass the .db path, "
+                         f"or <db>::<session_id> for one session)")
     recs = load_records(path)
     if harness == "auto":
         harness = detect_harness(recs)
@@ -2112,6 +2334,7 @@ def bm25_terms(pattern_str):
     """
     s = re.sub(r"\(\?[a-zA-Z]+\)", " ", pattern_str)     # inline flags like (?i)
     s = re.sub(r"\\[a-zA-Z]", " ", s)                    # \b \d \w \s ...
+    s = re.sub(r"\w\{0,?\d*\}|\w[?*]", " ", s)             # optional chars: tests? -> test, colou?r -> colo
     s = re.sub(r"\{\d*,?\d*\}", " ", s)                  # {2,5}
     seen, terms = set(), []
     for t in re.findall(r"\w{2,}", s):
@@ -2192,13 +2415,20 @@ def grep_search(results, pattern, keep=None, limit=0, rank=False):
 
 def compile_pass(input_path, output_dir=None, truncate=128, truncate_user=256,
             grep_pattern=None, quiet=False, keep=None, graph=False, harness="auto"):
-    if output_dir is None:
-        output_dir = os.path.dirname(os.path.abspath(input_path)) or "."
+    db, sep, sid = input_path.rpartition("::")
+    if sep and _is_sqlite(db):
+        # one session of a database: outputs go to <db>.vcc/<session>.*, not among its files
+        if output_dir is None:
+            output_dir = os.path.abspath(db) + ".vcc"
+        base = re.sub(r"[^\w.-]", "_", sid)
+    else:
+        if output_dir is None:
+            output_dir = os.path.dirname(os.path.abspath(input_path)) or "."
+        base = os.path.basename(input_path)
+        if base.endswith(".zst"):
+            base = base[:-4]
+        base = os.path.splitext(base)[0]
     os.makedirs(output_dir, exist_ok=True)
-    base = os.path.basename(input_path)
-    if base.endswith(".zst"):
-        base = base[:-4]
-    base = os.path.splitext(base)[0]
 
     recs, profile, _ = load(input_path, harness)
     recs = merge_chunks(recs)
@@ -2289,7 +2519,12 @@ def _expand_inputs(raw):
     for r in raw:
         expanded = globmod.glob(r, recursive=True)
         expanded.sort(key=lambda f: os.path.getmtime(f))
-        files.extend(expanded if expanded else [r])
+        for f in (expanded if expanded else [r]):
+            sessions = opencode_sessions(f) if "::" not in f and os.path.isfile(f) else []
+            if sessions:      # an OpenCode database: one input per session, oldest first
+                files.extend(f"{f}::{sid}" for sid, _ in sessions)
+            else:
+                files.append(f)
     return files
 
 def main():
@@ -2313,7 +2548,7 @@ def main():
                    help="with --grep: order hits by BM25 relevance to the pattern's words "
                         "instead of newest first (use an alternation of synonyms as the query)")
     p.add_argument("--harness", default="auto",
-                   choices=["auto", "claude-code", "codex", "gemini-cli", "chat"],
+                   choices=["auto", "claude-code", "codex", "gemini-cli", "opencode", "chat"],
                    help="log format (default: detect per file). 'chat' = JSONL of "
                         "{role, content, tool_calls?} messages, for any other harness")
     p.add_argument("--graph", action="store_true",

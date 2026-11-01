@@ -196,6 +196,9 @@ class TestBM25(VCCTestCase):
         self.assertEqual(VCC.bm25_terms(r"captcha|reCAPTCHA|bot.?detect"),
                          ["captcha", "recaptcha", "bot", "detect"])
         self.assertEqual(VCC.bm25_terms(r"(?i)\bdog\b|\d{2,3}x"), ["dog"])
+        # optional characters are not part of the literal term
+        self.assertEqual(VCC.bm25_terms(r"tests?|files*"), ["test", "file"])
+        self.assertEqual(VCC.bm25_terms(r"colou?r"), ["colo"])     # matches color and colour
 
     def test_rarer_terms_and_shorter_blocks_score_higher(self):
         docs = ["the dog and the cat", "the dog", "a cat", "the dog " + "filler " * 50]
@@ -665,6 +668,135 @@ class TestCodexAdapter(VCCTestCase):
         os.remove(self.jsonl)
         res = VCC.compile_pass(zpath, quiet=True)
         self.assertTrue(res[0][0].endswith(self.stem + "_1.txt"))
+
+
+class TestOpenCodeAdapter(unittest.TestCase):
+    """OpenCode SQLite storage (tables per anomalyco/opencode source). Synthetic databases:
+    no real OpenCode database has been tested."""
+
+    def setUp(self):
+        import sqlite3
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+        self.sqlite3 = sqlite3
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def make_v2(self):
+        db = os.path.join(self.dir, "opencode.db")
+        con = self.sqlite3.connect(db)
+        con.executescript("""
+            CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, parent_id TEXT, directory TEXT,
+                                     title TEXT, time_created INTEGER, time_updated INTEGER);
+            CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER,
+                                          time_created INTEGER, time_updated INTEGER, data TEXT);
+            CREATE TABLE session_part (message_id TEXT, session_id TEXT, ordinal INTEGER, type TEXT,
+                                       call_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT,
+                                       PRIMARY KEY (message_id, ordinal));""")
+        t0 = 1780000000000   # epoch ms
+        con.execute("INSERT INTO session_v2 VALUES ('ses_a','p',NULL,'/proj','Fix',?,?)", (t0, t0 + 9000))
+        con.execute("INSERT INTO session_v2 VALUES ('ses_child','p','ses_a','/proj','Sub',?,?)", (t0, t0 + 1))
+        msgs = [("msg_1", "user", 1, {"text": "Rename foo to bar in util.ts"}),
+                ("msg_2", "assistant", 2, {"agent": "build", "model": {"id": "m-x", "providerID": "p"}}),
+                ("msg_3", "compaction", 3, {"status": "completed", "reason": "auto",
+                                            "summary": "Renamed foo; tests pending."}),
+                ("msg_4", "user", 4, {"text": "now run the tests"})]
+        for mid, typ, seq, data in msgs:
+            con.execute("INSERT INTO session_message VALUES (?,?,?,?,?,?,?)",
+                        (mid, "ses_a", typ, seq, t0 + seq * 1000, t0 + seq * 1000, json.dumps(data)))
+        parts = [(0, "reasoning", None, {"type": "reasoning", "text": "Edit util.ts."}),
+                 (1, "tool", "call_1", {"type": "tool", "id": "call_1", "name": "edit",
+                                        "state": {"status": "completed",
+                                                  "input": {"filePath": "/proj/util.ts", "oldString": "foo",
+                                                            "newString": "bar"},
+                                                  "content": [{"type": "text", "text": "Edited."}]}}),
+                 (2, "tool", "call_2", {"type": "tool", "id": "call_2", "name": "bash",
+                                        "state": {"status": "error", "input": {"command": "npm test"},
+                                                  "error": {"message": "exit 1"}}}),
+                 (3, "text", None, {"type": "text", "text": "Renamed; tests fail."})]
+        for ordinal, typ, call_id, data in parts:
+            con.execute("INSERT INTO session_part VALUES (?,?,?,?,?,?,?,?)",
+                        ("msg_2", "ses_a", ordinal, typ, call_id, t0, t0, json.dumps(data)))
+        con.execute("INSERT INTO session_message VALUES ('msg_c','ses_child','user',1,?,?,?)",
+                    (t0, t0, json.dumps({"text": "subtask"})))
+        con.commit()
+        con.close()
+        return db
+
+    def test_v2_sessions_expand(self):
+        db = self.make_v2()
+        self.assertEqual([s for s, _ in VCC.opencode_sessions(db)], ["ses_child", "ses_a"])
+        self.assertEqual(VCC._expand_inputs([db]), [f"{db}::ses_child", f"{db}::ses_a"])
+
+    def test_v2_compile(self):
+        db = self.make_v2()
+        recs, profile, harness = VCC.load(f"{db}::ses_a")
+        self.assertEqual(harness, "opencode")
+        res = VCC.compile_pass(f"{db}::ses_a", quiet=True, graph=True)
+        out = db + ".vcc"
+        self.assertEqual(os.path.dirname(res[0][0]), out)          # not among OpenCode's files
+        with open(os.path.join(out, "ses_a_1.txt")) as f:
+            full = f.read()
+        self.assertIn("[user] 2026-", full)
+        self.assertIn("Rename foo to bar in util.ts", full)
+        self.assertIn(">>>thinking\nEdit util.ts.\n<<<thinking", full)
+        self.assertIn(">>>tool_call edit:call_1", full)
+        self.assertIn("[tool] edit:call_1\n\nEdited.", full)
+        self.assertIn("[tool_error] bash:call_2", full)
+        with open(os.path.join(out, "ses_a_2.txt")) as f:
+            after = f.read()
+        self.assertIn("[compact summary", after)
+        self.assertIn("now run the tests", after)
+        with open(os.path.join(out, "ses_a_1.files.txt")) as f:
+            files = f.read()
+        self.assertIn("cwd: /proj", files)
+        self.assertIn("M util.ts", files)
+        child, _, _ = VCC.load(f"{db}::ses_child")
+        self.assertEqual(child[0]["agentId"], "ses_child")
+
+    def test_v1(self):
+        db = os.path.join(self.dir, "legacy.db")
+        con = self.sqlite3.connect(db)
+        con.executescript("""
+            CREATE TABLE session (id TEXT PRIMARY KEY, data TEXT);
+            CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER,
+                                  time_updated INTEGER, data TEXT);
+            CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER,
+                               time_updated INTEGER, data TEXT);""")
+        t0 = 1780000000000
+        rows = [("msg_a", t0, {"role": "user", "time": {"created": t0}}),
+                ("msg_b", t0 + 1000, {"role": "assistant", "modelID": "m", "path": {"cwd": "/old", "root": "/old"},
+                                      "time": {"created": t0 + 1000}})]
+        for mid, tc, data in rows:
+            con.execute("INSERT INTO message VALUES (?,?,?,?,?)", (mid, "ses_1", tc, tc, json.dumps(data)))
+        parts = [("prt_1", "msg_a", {"type": "text", "text": "read the config"}),
+                 ("prt_2", "msg_a", {"type": "text", "text": "<file>...</file>", "synthetic": True}),
+                 ("prt_3", "msg_b", {"type": "tool", "callID": "c1", "tool": "read",
+                                     "state": {"status": "completed", "input": {"filePath": "/old/a.toml"},
+                                               "output": "x = 1"}})]
+        for pid, mid, data in parts:
+            con.execute("INSERT INTO part VALUES (?,?,?,?,?,?)", (pid, mid, "ses_1", t0, t0, json.dumps(data)))
+        con.commit()
+        con.close()
+        self.assertEqual(VCC._expand_inputs([db]), [f"{db}::ses_1"])
+        VCC.compile_pass(f"{db}::ses_1", quiet=True)
+        with open(os.path.join(db + ".vcc", "ses_1.txt")) as f:
+            full = f.read()
+        self.assertIn("read the config", full)
+        self.assertIn("[system]\n\n[synthetic] <file>", full)     # injected text kept out of the user turn
+        self.assertIn("[tool] read:c1\n\nx = 1", full)
+        with open(os.path.join(db + ".vcc", "ses_1.files.txt")) as f:
+            self.assertIn("R a.toml", f.read())
+
+    def test_non_opencode_sqlite_is_left_alone(self):
+        db = os.path.join(self.dir, "other.db")
+        con = self.sqlite3.connect(db)
+        con.execute("CREATE TABLE t (x)")
+        con.commit()
+        con.close()
+        self.assertEqual(VCC.opencode_sessions(db), [])
+        self.assertEqual(VCC._expand_inputs([db]), [db])
 
 
 class TestCLI(VCCTestCase):

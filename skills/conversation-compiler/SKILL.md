@@ -24,7 +24,7 @@ python "path/to/VCC.py" <input.jsonl ...> [options]
 | `--limit <N>` | With `--grep`: print at most N matching blocks, newest first, and report how many older ones were left out |
 | `--rank` | With `--grep`: order hits by BM25 relevance to the words in the pattern instead of newest first; each hit shows `bm25=<score>` |
 | `--graph` | Also write `.graph.txt`; with several input files, print a cross-conversation file index to stdout |
-| `--harness <name>` | Log format: `auto` (default, detected per file), `claude-code`, `codex`, `gemini-cli`, `chat` |
+| `--harness <name>` | Log format: `auto` (default, detected per file), `claude-code`, `codex`, `gemini-cli`, `opencode`, `chat` |
 
 This tool also supports multi-file processing:
 
@@ -41,6 +41,7 @@ The format is detected per file (override with `--harness`). Harness-specific kn
 | Claude Code | `~/.claude/projects/<project>/*.jsonl` (subagents: `<session>/subagents/*.jsonl`) | Deleted after 30 days by default (`cleanupPeriodDays`) |
 | Codex CLI | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (`$CODEX_HOME` if set) | Files older than 7 days become `.jsonl.zst`; reading those needs Python 3.14+ or `pip install zstandard` |
 | Gemini CLI | `~/.gemini/tmp/<project>/chats/session-*.jsonl` (subagents: `chats/<parent-id>/*.jsonl`; older: `session-*.json`) | |
+| OpenCode | SQLite database under `~/.local/share/opencode/` (or `$XDG_DATA_HOME/opencode/`) | Pass the database file: it expands to one conversation per session (`<db>::<session_id>` selects one). Views are written to `<db>.vcc/`. Experimental: built from OpenCode's source, not yet tested on a real database |
 | Anything else | Export to JSONL of `{"role", "content", "tool_calls"?, "timestamp"?}` messages (OpenAI/Anthropic style) | `--harness chat` |
 
 Use globs that match the harness's file names, e.g. `rollout-*.jsonl*` for Codex, `session-*.json*` for Gemini CLI.
