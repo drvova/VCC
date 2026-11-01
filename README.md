@@ -257,6 +257,7 @@ The adaptive view keeps conversation order so it is good for understanding conte
 * **Graph view** (`--graph` → `.graph.txt`): each user turn linked to the files it read/modified, its tool errors, and `[prev Tn]` links to the last earlier turn on the same file. With several JSONL files, stdout gets a cross-conversation file index ("where else did we work on this file?").
 * **Optional hook** (`vcc_hook.py`): compiles views when compaction starts, and/or archives logs so they survive Claude Code's 30-day `cleanupPeriodDays` deletion. See INSTALL.md.
 * **Faster**: lowering no longer rescans the whole IR per section (~1.8x faster on large logs, identical output).
+* **Evaluation**: `eval/longmemeval_retrieval.py` measures search on LongMemEval_S (470 questions, no LLM). Evidence in the top 10 hits: 19.6% newest-first vs **87.9% with `--rank`**. See `eval/README.md`.
 * **Tests**: `python -m unittest discover tests`.
 
 All of it is deterministic and computed from the JSONL (no LLM calls, no stored summaries). Line numbers are unchanged: timestamps are appended to existing header lines.
