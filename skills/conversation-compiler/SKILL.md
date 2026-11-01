@@ -22,6 +22,8 @@ python "path/to/VCC.py" <input.jsonl ...> [options]
 | `--role <types>` | With `--grep`: only these block types, comma-separated: `user`, `assistant`, `thinking`, `tool_call`, `tool_result`, `tool_error`, `system`. A prefix matches all subtypes (`tool` = all tool blocks) |
 | `--since <when>` / `--until <when>` | With `--grep`: only blocks in this UTC time range. `YYYY-MM-DD` or ISO-8601; a bare `--until` date includes that day |
 | `--limit <N>` | With `--grep`: print at most N matching blocks, newest first, and report how many older ones were left out |
+| `--rank` | With `--grep`: order hits by BM25 relevance to the words in the pattern instead of newest first; each hit shows `bm25=<score>` |
+| `--graph` | Also write `.graph.txt`; with several input files, print a cross-conversation file index to stdout |
 
 This tool also supports multi-file processing:
 
@@ -36,6 +38,7 @@ cd "/path/to/target/folder" && python "path/to/VCC.py" *.jsonl --grep "keyword"
 | `.txt` | Always | Full transcript, lossless |
 | `.min.txt` | Always | Brief overview |
 | `.files.txt` | If any file tool ran | Files touched by Read/Write/Edit/MultiEdit/NotebookEdit, newest first, `M` = modified / `R` = read only, with line refs |
+| `.graph.txt` | `--graph` only | One entry per user turn: its message, line range, tools used, errors, files read/modified, and `[prev Tn]` links to the last earlier turn that touched the same file; then a file → turns list |
 | `.view.txt` | `--grep` only | Search-focused view |
 | stdout | `--grep` only | Search results with block-level line range references |
 
@@ -109,10 +112,24 @@ Narrow searches instead of reading floods of hits:
 - Who said it: `--role user` for the user's own words, `--role assistant,thinking` for the agent's.
 - What went wrong: `--grep . --role tool_error` lists every failed tool call.
 - Many results: `--limit 30` shows the newest 30 and tells you how many older ones exist.
+- Unsure of the exact wording: put synonyms and spelling variants in one alternation and rank them, e.g. `--grep "captcha|recaptcha|bot.?detect|anti.?bot" --rank --limit 20`. The regex picks which blocks match; `--rank` puts blocks that mention more (and rarer) terms, in less surrounding text, first.
 
 **4. Jump to `.txt`**
 
 All line references point to `.txt`. Read the referenced range for full context. Remember to read a bit more lines before and after the referenced range to get more context.
+
+**5. Graph (optional)**
+
+Add `--graph` to get `.graph.txt`, a map of the conversation by user turn:
+
+```
+T3 2026-04-03 15:30Z (a.txt:52-83) "Rename the dog to Rex"
+  tools: Edit, Read
+  errors: Bash (a.txt:70-74)
+  M src/pets.py: Edit  [prev T1]
+```
+
+Use it to answer "which request changed this file, and what earlier turn touched it" (`[prev Tn]`), then jump to the turn's line range in `.txt`. With several JSONL files (`*.jsonl --graph`), stdout also lists, for each file, every turn in every conversation that touched it, newest first: use it to find "where else did we work on X".
 
 # SKILLs
 
@@ -132,7 +149,7 @@ All line references point to `.txt`. Read the referenced range for full context.
 2. `cd ~/.claude/projects/<project> && python "absolute/path/to/VCC.py" *.jsonl --grep "keyword"` — search top-level conversations first.
 3. If no results: `cd ~/.claude/projects/<project> && python "absolute/path/to/VCC.py" **/*.jsonl --grep "keyword"` — expand to subagents.
 
-Across many conversations, add `--limit 30` to keep output small, and `--since` when the user gives a time frame (logs last modified before `--since` are skipped without compiling, which is much faster). If nothing is found for older conversations, Claude Code may have deleted them: see "Keeping your history" in INSTALL.md.
+Across many conversations, add `--rank --limit 30` (most relevant 30 hits first) to keep output small, and `--since` when the user gives a time frame (logs last modified before `--since` are skipped without compiling, which is much faster). To find every conversation that worked on a given file, run `*.jsonl --graph` and read the file's entry in the printed index. If nothing is found for older conversations, Claude Code may have deleted them: see "Keeping your history" in INSTALL.md.
 
 **Critical**: Always `cd` into the target directory first, then use VCC globs — a single `cd && python VCC.py <glob> --grep` is the correct pattern. Without `cd`, grep output contains full absolute paths instead of short relative paths, wasting tokens. All content search on JSONL must use VCC's `--grep`, never system grep or the embedded Grep tool — VCC's `--grep` returns block-level line ranges with role tags that no other grep can provide.
 
@@ -149,4 +166,4 @@ Across many conversations, add `--limit 30` to keep output small, and `--since` 
 3. **Verify against current state** — After recovering the conversation, cross-check with reality:
    - **REALLY read files** — Use `.files.txt` as the checklist: it lists every file the conversation read or modified (`M` first priority). Files changed through Bash are not in it, so also scan `.min.txt` for Bash commands that write files. Read all files referenced in the conversation with your Read tool. Pre-loaded content from system-reminders or prior conversation turns does NOT count — it may be truncated, stale, or lossy. You must issue a fresh Read call for each file, even if you believe you already have its content. 99.97% of the time, the user has externally modified nearly every file between sessions. If you skip reading and miss their external changes, your failure rate is effectively 100%.
    - **Key details** — Identify specific values, paths, configs, and logic mentioned in the conversation. Compare against the actual files to catch drift or errors.
-   - **Understand the journey** — Trace the user's intent, decision sequence, and direction changes. Understand not just what was done, but how and why they got there.
+   - **Understand the journey** — Trace the user's intent, decision sequence, and direction changes. Understand not just what was done, but how and why they got there. For long conversations, compile with `--graph` and read `.graph.txt` first: it lists every user request in order with the files it changed and the errors it hit.

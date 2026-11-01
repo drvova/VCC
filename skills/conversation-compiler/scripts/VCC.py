@@ -5,6 +5,7 @@ Produces per conversation chain:
   .txt       Full transcript (lossless rendering of JSONL)
   .min.txt   Brief mode (tool_call summaries with line refs, no separators)
   .files.txt Files view (files touched by Read/Write/Edit, with line refs; if any)
+  .graph.txt Graph view (user turns <-> files touched, errors, links; only with --graph)
   .view.txt  View mode (search-focused, only with --grep)
 
 Usage:
@@ -16,6 +17,8 @@ Usage:
   python VCC.py project/*.jsonl --grep "kw"     # multi-file search
   python VCC.py *.jsonl --grep "kw" --since 2026-04-01 --role user,assistant --limit 20
   python VCC.py s.jsonl --grep . --role tool_error  # every failed tool call
+  python VCC.py *.jsonl --grep "captcha|recaptcha|bot.?detect" --rank --limit 20  # BM25 order
+  python VCC.py *.jsonl --graph                     # + cross-conversation file index on stdout
 """
 
 import argparse
@@ -912,6 +915,43 @@ def lower_brief(ir, truncate, filename="", truncate_user=256):
 
 # ── lowering: files ──
 
+def _tool_errors(ir):
+    """Map short_tid -> tool name for every tool call whose result is an error."""
+    errs = {}
+    for o in ir:
+        if o["type"] == "meta_header" and o["content"] and o["content"][0].startswith("[tool_error]"):
+            h = o["content"][0][len("[tool_error]"):].strip()
+            name, _, tid = h.rpartition(":")
+            errs[tid] = name or "unknown"
+    return errs
+
+def _blk_ranges(ir):
+    """Map blk -> (first_line, last_line), 0-based, over all nodes of the block."""
+    out = {}
+    for o in ir:
+        b, sl, el = o.get("_blk"), o.get("start_line"), o.get("end_line")
+        if b is None or sl is None or el is None:
+            continue
+        r = out.get(b)
+        out[b] = (sl, el) if r is None else (min(r[0], sl), max(r[1], el))
+    return out
+
+def _call_ref(o, blk_ranges, tid_ranges):
+    """'call_start-call_end,result_start-result_end' (1-based) for a tool_call meta node."""
+    rng = blk_ranges.get(o.get("_blk"))
+    ref = f"{rng[0]+1}-{rng[1]+1}" if rng else "?"
+    rr = tid_ranges.get(o.get("_tool_tid", ""))
+    if rr:
+        ref += f",{rr[0]+1}-{rr[1]+1}"
+    return ref
+
+def _disp_path(p, cwd):
+    if cwd:
+        base = cwd.rstrip("/\\")
+        if p.startswith(base + os.sep) or p.startswith(base + "/"):
+            return p[len(base) + 1:]
+    return p
+
 def lower_files(ir, filename="", cwd=None):
     """Files view: every file touched by a file tool, with pointers into the full view.
 
@@ -921,17 +961,8 @@ def lower_files(ir, filename="", cwd=None):
     """
     short = _short(filename)
     tid_ranges = _tid_result_ranges(ir)
-    err_tids = set()
-    for o in ir:
-        if o["type"] == "meta_header" and o["content"] and o["content"][0].startswith("[tool_error]"):
-            err_tids.add(o["content"][0].split(":")[-1])
-    blk_range = {}
-    for o in ir:
-        b, sl, el = o.get("_blk"), o.get("start_line"), o.get("end_line")
-        if b is None or sl is None or el is None:
-            continue
-        r = blk_range.get(b)
-        blk_range[b] = (sl, el) if r is None else (min(r[0], sl), max(r[1], el))
+    err_tids = _tool_errors(ir)
+    blk_range = _blk_ranges(ir)
 
     files = {}   # path -> {"ops": [...], "last": idx, "modified": bool}
     for idx, o in enumerate(ir):
@@ -939,11 +970,7 @@ def lower_files(ir, filename="", cwd=None):
         if not path:
             continue
         name, tid = o.get("_tool_name", "?"), o.get("_tool_tid", "")
-        rng = blk_range.get(o.get("_blk"))
-        ref = f"{rng[0]+1}-{rng[1]+1}" if rng else "?"
-        rr = tid_ranges.get(tid)
-        if rr:
-            ref += f",{rr[0]+1}-{rr[1]+1}"
+        ref = _call_ref(o, blk_range, tid_ranges)
         err = tid in err_tids
         f = files.setdefault(path, {"ops": [], "last": idx, "last_op": name,
                                     "last_ts": None, "modified": False})
@@ -953,11 +980,6 @@ def lower_files(ir, filename="", cwd=None):
             f["modified"] = True
     if not files:
         return None
-
-    def _disp(p):
-        if cwd and p.startswith(cwd.rstrip("/\\") + os.sep):
-            return p[len(cwd.rstrip("/\\")) + 1:]
-        return p
 
     nmod = sum(1 for f in files.values() if f["modified"])
     out = [f"[files] {len(files)} file(s) touched, {nmod} modified "
@@ -969,10 +991,184 @@ def lower_files(ir, filename="", cwd=None):
     for path, f in sorted(files.items(), key=lambda kv: -kv[1]["last"]):
         ts = _fmt_ts(f["last_ts"])
         out.append("")
-        out.append(f"{'M' if f['modified'] else 'R'} {_disp(path)}  "
+        out.append(f"{'M' if f['modified'] else 'R'} {_disp_path(path, cwd)}  "
                    f"(last: {f['last_op']}" + (f" {ts}" if ts else "") + ")")
         out.extend(f["ops"])
     out.append("")
+    return out
+
+
+# ── lowering: graph ──
+
+def build_turns(ir):
+    """Group the IR into user turns: each visible user message plus the work it triggered.
+
+    A turn is a [user] section that brief mode would show (harness noise is not a turn),
+    followed by every section up to the next turn. Work done before the first user
+    message becomes turn 0. Returns a list of dicts (0-based line numbers).
+    """
+    from collections import OrderedDict
+    roles = _sec_roles(ir)
+    by_sec = _searchable_by_sec(ir)
+    sec_lines, sec_header = {}, {}
+    for o in ir:
+        s, sl, el = o.get("_sec"), o.get("start_line"), o.get("end_line")
+        if s is None or sl is None:
+            continue
+        r = sec_lines.get(s)
+        sec_lines[s] = (sl, el) if r is None else (min(r[0], sl), max(r[1], el))
+        if o["type"] == "meta_header":
+            sec_header[s] = o
+    turn_secs = [s for s in sorted(roles) if roles[s] == "user"
+                 and not _user_hidden_in_brief(ir, s, by_sec)
+                 and not _section_hidden_exact(ir, s, by_sec)]
+
+    def _new(num, sec):
+        hdr = sec_header.get(sec) if sec is not None else None
+        text = ""
+        if sec is not None:
+            raw = "\n".join("\n".join(o["content"]) for o in by_sec.get(sec, []))
+            text = _strip_noise_xml(raw) or ""
+            if not text and hdr is not None:   # e.g. a compact summary placeholder
+                text = "\n".join(o["content"][0] for o in ir
+                                 if o.get("_sec") == sec and o["type"] == "user")
+        first = next((l.strip() for l in text.split("\n") if l.strip()), "")
+        if len(first) > 80:
+            first = first[:77] + "..."
+        return {"num": num, "sec": sec, "ts": hdr.get("_ts") if hdr else None,
+                "text": first, "start": None, "end": None,
+                "tools": OrderedDict(), "errors": [], "files": OrderedDict()}
+
+    # Turn boundaries (by section id): turn k spans [turn_secs[k], turn_secs[k+1]).
+    turns = [_new(i + 1, s) for i, s in enumerate(turn_secs)]
+    first_turn_sec = turn_secs[0] if turn_secs else None
+    pre = _new(0, None)
+    import bisect
+
+    def _turn_for(sec):
+        if first_turn_sec is None or sec < first_turn_sec:
+            return pre
+        return turns[bisect.bisect_right(turn_secs, sec) - 1]
+
+    for s in sorted(sec_lines):
+        t = _turn_for(s)
+        sl, el = sec_lines[s]
+        t["start"] = sl if t["start"] is None else min(t["start"], sl)
+        t["end"] = el if t["end"] is None else max(t["end"], el)
+        if t["ts"] is None and s in sec_header:   # turn 0 has no user header: use its first section
+            t["ts"] = sec_header[s].get("_ts")
+
+    tid_ranges = _tid_result_ranges(ir)
+    errs = _tool_errors(ir)
+    blk_range = _blk_ranges(ir)
+    for o in ir:
+        name = o.get("_tool_name")
+        if not name or o.get("_sec") is None:
+            continue
+        t = _turn_for(o["_sec"])
+        if name not in _BRIEF_HIDE_TOOLS:
+            t["tools"][name] = t["tools"].get(name, 0) + 1
+        tid = o.get("_tool_tid", "")
+        err = tid in errs
+        if err:
+            rr = tid_ranges.get(tid)
+            t["errors"].append((name, f"{rr[0]+1}-{rr[1]+1}" if rr else "?"))
+        path = o.get("_tool_file")
+        if path:
+            t["files"].setdefault(path, []).append((name, err, _call_ref(o, blk_range, tid_ranges)))
+    if pre["tools"] or pre["errors"]:
+        turns.insert(0, pre)
+    return turns
+
+def _file_status(ops):
+    return "M" if any(n in _FILE_WRITE_TOOLS and not e for n, e, _ in ops) else "R"
+
+def _ops_str(ops):
+    """'Read(error), Edit x4': consecutive identical operations are collapsed."""
+    runs = []
+    for n, e, _ in ops:
+        key = n + ("(error)" if e else "")
+        if runs and runs[-1][0] == key:
+            runs[-1][1] += 1
+        else:
+            runs.append([key, 1])
+    return ", ".join(k + (f" x{c}" if c > 1 else "") for k, c in runs)
+
+def lower_graph(ir, filename="", cwd=None, turns=None):
+    """Graph view: user turns linked to the files they touched and to earlier turns.
+
+    Nodes are turns (T) and files (F). Edges: turn -> file (with the operations),
+    file -> previous turn on that file ("prev"), and per-file lists of all turns.
+    Every node carries a pointer into the full view. Returns a list of lines.
+    """
+    short = _short(filename)
+    turns = build_turns(ir) if turns is None else turns
+    if not turns:
+        return None
+    last_turn_on = {}          # path -> num of last turn that touched it
+    file_turns = {}            # path -> [(num, ops)]
+    nerr = sum(len(t["errors"]) for t in turns)
+    nfiles_mod = set()
+    body = []
+    for t in turns:
+        ts = _fmt_ts(t["ts"])
+        rng = f"{short}:{t['start']+1}-{t['end']+1}" if t["start"] is not None else short
+        label = f'"{t["text"]}"' if t["num"] else "(before the first user message)"
+        body.append("")
+        body.append(f"T{t['num']}" + (f" {ts}" if ts else "") + f" ({rng}) {label}")
+        if t["tools"]:
+            body.append("  tools: " + ", ".join(
+                n + (f" x{c}" if c > 1 else "") for n, c in t["tools"].items()))
+        if t["errors"]:
+            body.append("  errors: " + ", ".join(f"{n} ({short}:{r})" for n, r in t["errors"]))
+        for path, ops in t["files"].items():
+            st = _file_status(ops)
+            if st == "M":
+                nfiles_mod.add(path)
+            prev = last_turn_on.get(path)
+            body.append(f"  {st} {_disp_path(path, cwd)}: {_ops_str(ops)}"
+                        + (f"  [prev T{prev}]" if prev is not None else ""))
+            last_turn_on[path] = t["num"]
+            file_turns.setdefault(path, []).append((t["num"], ops))
+
+    head = [f"[graph] {sum(1 for t in turns if t['num'])} turn(s), {len(file_turns)} file(s) "
+            f"({len(nfiles_mod)} modified), {nerr} tool error(s). Pointers into {short}."]
+    if cwd:
+        head.append(f"cwd: {cwd}")
+    head.append("T = user turn (its message and the work it triggered). M/R = modified/read in that turn.")
+    head.append("[prev Tn] = the last earlier turn that touched the same file. Bash file changes are not tracked.")
+    tail = []
+    if file_turns:
+        tail = ["", "[files -> turns]"]
+        for path, lst in sorted(file_turns.items(), key=lambda kv: -kv[1][-1][0]):
+            tail.append(f"F {_disp_path(path, cwd)}: " + "  ".join(
+                f"T{n}({_ops_str(ops)})" for n, ops in lst))
+    return head + body + tail + [""]
+
+def graph_index(entries):
+    """Cross-conversation file index: for each file, every turn in every conversation.
+
+    entries: list of (full_view_path, cwd, turns). Newest activity first.
+    """
+    cwds = {c for _, c, _ in entries if c}
+    common = cwds.pop() if len(cwds) == 1 else None
+    by_file = {}
+    for fp, cwd, turns in entries:
+        short = _rel_path(fp)
+        for t in turns:
+            for path, ops in t["files"].items():
+                by_file.setdefault(path, []).append((t["ts"] or "", short, t, ops))
+    if not by_file:
+        return []
+    out = [f"[graph index] {len(by_file)} file(s) across {len(entries)} conversation(s), "
+           "newest activity first" + (f"; paths relative to {common}" if common else "")]
+    for path, hits in sorted(by_file.items(), key=lambda kv: max(h[0] for h in kv[1]), reverse=True):
+        hits.sort(key=lambda h: h[0], reverse=True)
+        out.append("")
+        out.append(f"{_file_status([op for h in hits for op in h[3]])} {_disp_path(path, common)}")
+        for ts, short, t, ops in hits:
+            rng = f"{short}:{t['start']+1}-{t['end']+1}" if t["start"] is not None else short
+            out.append(f"  {_fmt_ts(ts) or '?':<17}  {_ops_str(ops):<24} ({rng}) T{t['num']} \"{t['text']}\"")
     return out
 
 
@@ -1118,37 +1314,98 @@ def make_block_filter(roles=None, since=None, until=None):
         return True
     return keep
 
-def grep_search(results, pattern, keep=None, limit=0):
-    """Print matching blocks newest-first. limit>0 caps the number of blocks printed."""
-    first = True
-    shown = hidden = 0
-    for filepath, ir in reversed(results):
+# ── ranking (BM25) ──
+
+_BM25_K1, _BM25_B = 1.2, 0.75
+
+def bm25_terms(pattern_str):
+    """Query terms for ranking, taken from the literal words of a --grep regex.
+
+    `captcha|recaptcha|bot.?detect` -> ['captcha', 'recaptcha', 'bot', 'detect'].
+    Regex escapes (\\b, \\d, ...), inline flags and counted repeats are ignored.
+    """
+    s = re.sub(r"\(\?[a-zA-Z]+\)", " ", pattern_str)     # inline flags like (?i)
+    s = re.sub(r"\\[a-zA-Z]", " ", s)                    # \b \d \w \s ...
+    s = re.sub(r"\{\d*,?\d*\}", " ", s)                  # {2,5}
+    seen, terms = set(), []
+    for t in re.findall(r"\w{2,}", s):
+        t = t.lower()
+        if t not in seen:
+            seen.add(t)
+            terms.append(t)
+    return terms
+
+def bm25_scores(docs, candidates, terms):
+    """Okapi BM25 for `candidates` (indices into docs) over the corpus `docs`.
+
+    docs are lowercased block texts. Term frequency counts substring occurrences
+    (like the regex grep, and it works for scripts without spaces such as CJK).
+    Document length is measured in characters.
+    """
+    import math
+    n = len(docs)
+    if not n or not terms:
+        return {i: 0.0 for i in candidates}
+    avgdl = (sum(len(d) for d in docs) / n) or 1.0
+    df = {t: sum(1 for d in docs if t in d) for t in terms}
+    idf = {t: math.log(1 + (n - df[t] + 0.5) / (df[t] + 0.5)) for t in terms}
+    out = {}
+    for i in candidates:
+        d = docs[i]
+        norm = _BM25_K1 * (1 - _BM25_B + _BM25_B * len(d) / avgdl)
+        sc = 0.0
+        for t in terms:
+            tf = d.count(t)
+            if tf:
+                sc += idf[t] * tf * (_BM25_K1 + 1) / (tf + norm)
+        out[i] = sc
+    return out
+
+def grep_search(results, pattern, keep=None, limit=0, rank=False):
+    """Print matching blocks, newest first, or by BM25 relevance with rank=True.
+
+    limit>0 caps the number of blocks printed and reports how many were left out.
+    """
+    hits, docs, cand = [], [], []
+    for entry in reversed(results):
+        filepath, ir = entry[0], entry[1]
         short = _rel_path(filepath)
         for o in reversed(ir):
             if not o["searchable"]: continue
             if keep is not None and not keep(o): continue
+            if rank:
+                docs.append("\n".join(o["content"]).lower())
             lines = match_lines(o["content"], pattern, short, o.get("start_line", 0) + 1)
             if len(lines) <= 1:
                 continue
-            if limit and shown >= limit:
-                hidden += 1
-                continue
-            shown += 1
-            if not first: print()
-            first = False
-            ts = _fmt_ts(o.get("_ts"))
-            print(f"{lines[0]} [{o['type']}]" + (f" {ts}" if ts else ""))
-            for lt in lines[1:]:
-                print(lt)
+            hits.append((o, lines))
+            cand.append(len(docs) - 1)
+    scores = None
+    if rank:
+        sc = bm25_scores(docs, cand, bm25_terms(pattern.pattern))
+        scores = [sc[i] for i in cand]
+        order = sorted(range(len(hits)), key=lambda k: -scores[k])  # stable: ties stay newest-first
+        hits = [hits[k] for k in order]
+        scores = [scores[k] for k in order]
+    shown = hits if not limit else hits[:limit]
+    for k, (o, lines) in enumerate(shown):
+        if k: print()
+        ts = _fmt_ts(o.get("_ts"))
+        print(f"{lines[0]} [{o['type']}]" + (f" {ts}" if ts else "")
+              + (f" bm25={scores[k]:.2f}" if scores is not None else ""))
+        for lt in lines[1:]:
+            print(lt)
+    hidden = len(hits) - len(shown)
     if hidden:
-        print(f"\n... {hidden} older matching block(s) not shown (--limit {limit}); "
+        what = "lower-ranked" if rank else "older"
+        print(f"\n... {hidden} {what} matching block(s) not shown (--limit {limit}); "
               f"narrow with --since/--until/--role or raise --limit")
 
 
 # ── compile ──
 
 def compile_pass(input_path, output_dir=None, truncate=128, truncate_user=256,
-            grep_pattern=None, quiet=False, keep=None):
+            grep_pattern=None, quiet=False, keep=None, graph=False):
     if output_dir is None:
         output_dir = os.path.dirname(os.path.abspath(input_path)) or "."
     os.makedirs(output_dir, exist_ok=True)
@@ -1169,6 +1426,7 @@ def compile_pass(input_path, output_dir=None, truncate=128, truncate_user=256,
         mfn = f"{base}{sfx}.min.txt"
         vfn = f"{base}{sfx}.view.txt"
         filesfn = f"{base}{sfx}.files.txt"
+        graphp = os.path.join(output_dir, f"{base}{sfx}.graph.txt")
         fp = os.path.join(output_dir, ffn)
         mp = os.path.join(output_dir, mfn)
         vp = os.path.join(output_dir, vfn)
@@ -1196,6 +1454,12 @@ def compile_pass(input_path, output_dir=None, truncate=128, truncate_user=256,
         elif os.path.exists(filesp):
             os.remove(filesp)  # stale view from an earlier compile
 
+        turns = None
+        if graph:
+            turns = build_turns(ir)
+            with open(graphp, "w", encoding="utf-8") as f:
+                f.write("\n".join(lower_graph(ir, ffn, cwd, turns) or ["[graph] empty"]))
+
         if grep_pattern:
             lower_view(ir, ffn, grep_pattern, keep)
             view = emit(ir, "content_view")
@@ -1203,21 +1467,22 @@ def compile_pass(input_path, output_dir=None, truncate=128, truncate_user=256,
 
         ft, bt = "\n".join(full), "\n".join(brief)
         _cnt = lambda s: sum(1 for t in _tokenize(s) if t.strip())
-        results.append((fp, ir))
+        results.append((fp, ir, cwd, turns))
         paths.append((fp, mp, vp if grep_pattern else None,
                        len(full), _cnt(ft), len(brief), _cnt(bt),
-                       filesp if files_view else None))
+                       filesp if files_view else None, graphp if graph else None))
 
     if not quiet:
-        for fp, _, _, fl, fw, _, _, _ in paths:
+        for fp, _, _, fl, fw, *_ in paths:
             print(f"  {fp}  ({fl} lines, {fw} words)")
-        for _, mp, _, _, _, bl, bw, _ in paths:
+        for _, mp, _, _, _, bl, bw, *_ in paths:
             print(f"  {mp}  ({bl} lines, {bw} words)")
-        for *_, xp in paths:
-            if xp:
-                print(f"  {xp}")
+        for *_, xp, gp in paths:
+            for extra in (xp, gp):
+                if extra:
+                    print(f"  {extra}")
         if grep_pattern:
-            for _, _, vp, _, _, _, _, _ in paths:
+            for _, _, vp, *_ in paths:
                 if vp:
                     print(f"  {vp}")
 
@@ -1250,13 +1515,19 @@ def main():
                    help="with --grep: only blocks before this UTC time (a bare date includes that day)")
     p.add_argument("--limit", type=int, default=0, metavar="N",
                    help="with --grep: print at most N matching blocks, newest first (0 = no limit)")
+    p.add_argument("--rank", action="store_true",
+                   help="with --grep: order hits by BM25 relevance to the pattern's words "
+                        "instead of newest first (use an alternation of synonyms as the query)")
+    p.add_argument("--graph", action="store_true",
+                   help="also write .graph.txt (user turns <-> files touched); with several "
+                        "conversations, print a cross-conversation file index")
     a = p.parse_args()
     try:
         a.grep = re.compile(a.grep) if a.grep else None
     except re.error as e:
         p.error(f"invalid regex for --grep: {e}")
-    if (a.role or a.since or a.until or a.limit) and not a.grep:
-        p.error("--role/--since/--until/--limit require --grep (use --grep . to match everything)")
+    if (a.role or a.since or a.until or a.limit or a.rank) and not a.grep:
+        p.error("--role/--since/--until/--limit/--rank require --grep (use --grep . to match everything)")
     try:
         since = _parse_when(a.since) if a.since else None
         until = _parse_when(a.until, end=True) if a.until else None
@@ -1270,10 +1541,17 @@ def main():
         if since is not None and os.path.exists(f) and os.path.getmtime(f) < since.timestamp():
             continue
         res = compile_pass(f, a.output_dir, a.truncate, a.truncate_user,
-                      a.grep, quiet=bool(a.grep), keep=keep)
+                      a.grep, quiet=bool(a.grep), keep=keep, graph=a.graph)
         all_results.extend(res)
+    if a.graph and len(all_results) > 1:
+        idx = graph_index([(fp, cwd, turns) for fp, _, cwd, turns in all_results])
+        if idx:
+            print()
+            print("\n".join(idx))
     if a.grep:
-        grep_search(all_results, a.grep, keep, a.limit)
+        if a.graph and len(all_results) > 1:
+            print()
+        grep_search(all_results, a.grep, keep, a.limit, a.rank)
 
 if __name__ == "__main__":
     if sys.stdout.encoding and sys.stdout.encoding.lower().replace("-", "") != "utf8":

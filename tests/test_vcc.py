@@ -191,6 +191,107 @@ class TestFilesView(VCCTestCase):
         self.assertFalse(os.path.exists(os.path.join(self.dir, "session.files.txt")))
 
 
+class TestBM25(VCCTestCase):
+    def test_terms_from_regex(self):
+        self.assertEqual(VCC.bm25_terms(r"captcha|reCAPTCHA|bot.?detect"),
+                         ["captcha", "recaptcha", "bot", "detect"])
+        self.assertEqual(VCC.bm25_terms(r"(?i)\bdog\b|\d{2,3}x"), ["dog"])
+
+    def test_rarer_terms_and_shorter_blocks_score_higher(self):
+        docs = ["the dog and the cat", "the dog", "a cat", "the dog " + "filler " * 50]
+        sc = VCC.bm25_scores(docs, [0, 1, 2, 3], ["dog", "cat"])
+        self.assertGreater(sc[0], sc[1])       # both terms beat one term
+        self.assertGreater(sc[1], sc[3])       # same term, shorter block wins
+        sc2 = VCC.bm25_scores(docs + ["the dog"] * 5, [0, 2], ["dog", "cat"])
+        self.assertGreater(sc2[2], 0)          # "cat" is now the rarer, heavier term
+
+    def test_rank_orders_by_relevance_not_recency(self):
+        res = self.compile(grep_pattern=re.compile("Rex|Buddy|pets"))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            VCC.grep_search(res, re.compile("Rex|Buddy|pets"), rank=True)
+        heads = [l for l in buf.getvalue().split("\n") if l.startswith("(")]
+        scores = [float(h.rsplit("bm25=", 1)[1]) for h in heads]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+        self.assertIn("[tool_call]", heads[0])  # the Write call mentions pets.py and Buddy
+
+    def test_rank_with_limit_footer(self):
+        res = self.compile(grep_pattern=re.compile("dog"))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            VCC.grep_search(res, re.compile("dog"), limit=1, rank=True)
+        self.assertIn("lower-ranked matching block(s) not shown", buf.getvalue())
+
+
+class TestGraph(VCCTestCase):
+    def test_turns_and_file_edges(self):
+        self.compile(graph=True)
+        g = self.read("session.graph.txt")
+        text = "\n".join(g)
+        self.assertIn("[graph] 2 turn(s), 2 file(s) (1 modified), 1 tool error(s)", text)
+        self.assertIn('T1 2026-04-01 09:00Z (session.txt:1-', text)
+        self.assertIn('"Write a pets module with a dog named Buddy."', text)
+        self.assertIn("  M src/pets.py: Read(error), Write", text)
+        self.assertIn("  M src/pets.py: Edit  [prev T1]", text)          # back-link
+        self.assertIn("  R /elsewhere/README.md: Read", text)
+        self.assertIn("F src/pets.py: T1(Read(error), Write)  T2(Edit)", text)
+        self.assertIn("  tools: Edit, Read", text)
+
+    def test_turn_ranges_point_at_user_header(self):
+        self.compile(graph=True)
+        full = self.read("session.txt")
+        for line in self.read("session.graph.txt"):
+            m = re.match(r"^T(\d+) .*\(session\.txt:(\d+)-(\d+)\)", line)
+            if m:
+                self.assertTrue(full[int(m.group(2)) - 1].startswith("[user]"))
+
+    def test_ops_collapse(self):
+        self.assertEqual(VCC._ops_str([("Edit", False, ""), ("Edit", False, ""),
+                                       ("Read", True, ""), ("Edit", False, "")]),
+                         "Edit x2, Read(error), Edit")
+
+    def test_work_before_first_user_message_is_turn_zero(self):
+        recs = [{"type": "assistant", "timestamp": "2026-04-01T08:59:00Z",
+                 "message": {"id": "m0", "content": [
+                     {"type": "tool_use", "id": "toolu_00000000zzzz", "name": "Read",
+                      "input": {"file_path": "/x/a.py"}}]}},
+                {"type": "user", "timestamp": "2026-04-01T08:59:01Z", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_00000000zzzz", "content": "ok"}]}}] \
+            + _records()
+        with open(self.jsonl, "w", encoding="utf-8") as f:
+            f.write("\n".join(json.dumps(r) for r in recs) + "\n")
+        self.compile(graph=True)
+        text = "\n".join(self.read("session.graph.txt"))
+        self.assertIn("T0 2026-04-01 08:59Z", text)  # header timestamp of the first section
+        self.assertIn("(before the first user message)", text)
+        self.assertIn("[graph] 2 turn(s)", text)      # T0 is not counted as a user turn
+
+    def test_cross_conversation_index(self):
+        other = os.path.join(self.dir, "other.jsonl")
+        with open(other, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "user", "timestamp": "2026-05-01T10:00:00Z", "cwd": CWD,
+                                "message": {"content": "Add a cat to the pets module."}}) + "\n")
+            f.write(json.dumps({"type": "assistant", "timestamp": "2026-05-01T10:00:02Z", "cwd": CWD,
+                                "message": {"id": "o1", "content": [
+                                    {"type": "tool_use", "id": "toolu_0000000other", "name": "Edit",
+                                     "input": {"file_path": CWD + "/src/pets.py"}}]}}) + "\n")
+        r = subprocess.run([sys.executable, os.path.join(SCRIPTS, "VCC.py"), self.jsonl, other,
+                            "--graph"], capture_output=True, text=True, cwd=self.dir)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = r.stdout
+        self.assertIn("[graph index] 2 file(s) across 2 conversation(s)", out)
+        self.assertIn(f"paths relative to {CWD}", out)
+        block = out.split("M src/pets.py", 1)[1].split("\n\n", 1)[0].strip().split("\n")
+        self.assertIn("other.txt", block[0])        # newest conversation first
+        self.assertIn('"Add a cat to the pets module."', block[0])
+        self.assertIn("session.txt", block[1])
+        self.assertTrue(os.path.exists(os.path.join(self.dir, "other.graph.txt")))
+
+    def test_no_graph_by_default(self):
+        self.compile()
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "session.graph.txt")))
+
+
 class TestCLI(VCCTestCase):
     def run_cli(self, *args):
         return subprocess.run([sys.executable, os.path.join(SCRIPTS, "VCC.py"), self.jsonl, *args],
