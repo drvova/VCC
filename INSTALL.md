@@ -14,13 +14,15 @@ Clone this repo to any temporary location. Delete the four folders (`conversatio
 
 ## Keeping your history (recommended)
 
-VCC reads the JSONL logs in `~/.claude/projects/`. By default Claude Code **deletes logs older than 30 days** at startup (`cleanupPeriodDays`, default 30). To search further back, raise it in `~/.claude/settings.json`:
+VCC can only read logs that still exist. By default Claude Code **deletes logs older than 30 days** at startup (`cleanupPeriodDays`, default 30). To search further back, raise it in `~/.claude/settings.json`:
 
 ```json
 { "cleanupPeriodDays": 3650 }
 ```
 
-## Optional hooks
+Gemini CLI also cleans up old sessions (30 days by default; see its session-management settings). Codex keeps rollouts but compresses those older than 7 days to `.jsonl.zst`, which VCC reads with Python 3.14+ or `pip install zstandard`.
+
+## Optional hooks (Claude Code)
 
 `scripts/vcc_hook.py` (inside `conversation-compiler`) can run as a Claude Code hook. It never blocks or fails Claude Code: errors go to stderr and it always exits 0.
 

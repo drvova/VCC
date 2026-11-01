@@ -1,11 +1,11 @@
 ---
 name: conversation-compiler
-description: "VCC (View-oriented Conversation Compiler) documentation. Compile Claude Code JSONL logs into adaptive views."
+description: "VCC (View-oriented Conversation Compiler) documentation. Compile coding-agent conversation logs (Claude Code, Codex CLI, Gemini CLI, or generic chat JSONL) into adaptive views."
 ---
 
 # VCC — View-oriented Conversation Compiler
 
-Compile Claude Code JSONL logs into adaptive views for reading, searching, and context recovery.
+Compile coding-agent conversation logs into adaptive views for reading, searching, and context recovery.
 
 ## Usage
 
@@ -24,12 +24,26 @@ python "path/to/VCC.py" <input.jsonl ...> [options]
 | `--limit <N>` | With `--grep`: print at most N matching blocks, newest first, and report how many older ones were left out |
 | `--rank` | With `--grep`: order hits by BM25 relevance to the words in the pattern instead of newest first; each hit shows `bm25=<score>` |
 | `--graph` | Also write `.graph.txt`; with several input files, print a cross-conversation file index to stdout |
+| `--harness <name>` | Log format: `auto` (default, detected per file), `claude-code`, `codex`, `gemini-cli`, `chat` |
 
 This tool also supports multi-file processing:
 
 ```bash
 cd "/path/to/target/folder" && python "path/to/VCC.py" *.jsonl --grep "keyword"
 ```
+
+## Supported logs
+
+The format is detected per file (override with `--harness`). Harness-specific knowledge lives only in small input adapters and profiles; tool calls are understood from the shape of their arguments, not from tool names, so files/graph views work the same for every harness.
+
+| Harness | Where the logs are | Notes |
+|---|---|---|
+| Claude Code | `~/.claude/projects/<project>/*.jsonl` (subagents: `<session>/subagents/*.jsonl`) | Deleted after 30 days by default (`cleanupPeriodDays`) |
+| Codex CLI | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (`$CODEX_HOME` if set) | Files older than 7 days become `.jsonl.zst`; reading those needs Python 3.14+ or `pip install zstandard` |
+| Gemini CLI | `~/.gemini/tmp/<project>/chats/session-*.jsonl` (subagents: `chats/<parent-id>/*.jsonl`; older: `session-*.json`) | |
+| Anything else | Export to JSONL of `{"role", "content", "tool_calls"?, "timestamp"?}` messages (OpenAI/Anthropic style) | `--harness chat` |
+
+Use globs that match the harness's file names, e.g. `rollout-*.jsonl*` for Codex, `session-*.json*` for Gemini CLI.
 
 ## Output Files
 
@@ -141,15 +155,15 @@ Use it to answer "which request changed this file, and what earlier turn touched
 
 ## /searchchat — Search across conversation logs
 
-**Trigger**: The user wants to search across conversation logs in `~/.claude/projects/`.
+**Trigger**: The user wants to search across past conversation logs (see "Supported logs" for where each harness keeps them).
 
 **Action**:
 
-1. `ls ~/.claude/projects/` — browse project directories, narrow the search area.
-2. `cd ~/.claude/projects/<project> && python "absolute/path/to/VCC.py" *.jsonl --grep "keyword"` — search top-level conversations first.
-3. If no results: `cd ~/.claude/projects/<project> && python "absolute/path/to/VCC.py" **/*.jsonl --grep "keyword"` — expand to subagents.
+1. Find the log directory for the harness you are running in (table in "Supported logs"); `ls` it to narrow the search area (for Claude Code: `ls ~/.claude/projects/`).
+2. `cd <log dir> && python "absolute/path/to/VCC.py" *.jsonl --grep "keyword"` — search top-level conversations first (Codex: `cd ~/.codex/sessions && ... "**/rollout-*.jsonl*"`).
+3. If no results: `cd <log dir> && python "absolute/path/to/VCC.py" **/*.jsonl --grep "keyword"` — expand to subagents.
 
-Across many conversations, add `--rank --limit 30` (most relevant 30 hits first) to keep output small, and `--since` when the user gives a time frame (logs last modified before `--since` are skipped without compiling, which is much faster). To find every conversation that worked on a given file, run `*.jsonl --graph` and read the file's entry in the printed index. If nothing is found for older conversations, Claude Code may have deleted them: see "Keeping your history" in INSTALL.md.
+Across many conversations, add `--rank --limit 30` (most relevant 30 hits first) to keep output small, and `--since` when the user gives a time frame (logs last modified before `--since` are skipped without compiling, which is much faster). To find every conversation that worked on a given file, run `*.jsonl --graph` and read the file's entry in the printed index. If nothing is found for older conversations, the harness may have deleted them (Claude Code and Gemini CLI default to 30 days): see "Keeping your history" in INSTALL.md.
 
 **Critical**: Always `cd` into the target directory first, then use VCC globs — a single `cd && python VCC.py <glob> --grep` is the correct pattern. Without `cd`, grep output contains full absolute paths instead of short relative paths, wasting tokens. All content search on JSONL must use VCC's `--grep`, never system grep or the embedded Grep tool — VCC's `--grep` returns block-level line ranges with role tags that no other grep can provide.
 
@@ -159,9 +173,9 @@ Across many conversations, add `--rank --limit 30` (most relevant 30 hits first)
 
 **Action**:
 
-1. **Find JSONL filename** — The continuation message ends with `read the full transcript at: <path>.jsonl`. Find that JSONL filename. If no JSONL path is present (e.g. the user invoked `/recall` manually without a continuation header), use the `/searchchat` method to locate the JSONL before proceeding to steps 2–3.
+1. **Find the log file** — In Claude Code, the continuation message ends with `read the full transcript at: <path>.jsonl`. Otherwise (another harness, or `/recall` invoked manually), the current session is usually the most recently modified log in the harness's log directory ("Supported logs"); use the `/searchchat` method to locate it before proceeding to steps 2–3.
 
-2. **Follow VCC Workflow** — Follow the full Workflow above (compile → read `.min.txt` → `--grep` → jump to `.txt`) with the JSONL file found in step 1. The summary is lossy — only the original JSONL is authoritative.
+2. **Follow VCC Workflow** — Follow the full Workflow above (compile → read `.min.txt` → `--grep` → jump to `.txt`) with the log file found in step 1. The summary is lossy — only the original log is authoritative.
 
 3. **Verify against current state** — After recovering the conversation, cross-check with reality:
    - **REALLY read files** — Use `.files.txt` as the checklist: it lists every file the conversation read or modified (`M` first priority). Files changed through Bash are not in it, so also scan `.min.txt` for Bash commands that write files. Read all files referenced in the conversation with your Read tool. Pre-loaded content from system-reminders or prior conversation turns does NOT count — it may be truncated, stale, or lossy. You must issue a fresh Read call for each file, even if you believe you already have its content. 99.97% of the time, the user has externally modified nearly every file between sessions. If you skip reading and miss their external changes, your failure rate is effectively 100%.

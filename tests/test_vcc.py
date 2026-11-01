@@ -292,6 +292,277 @@ class TestGraph(VCCTestCase):
         self.assertFalse(os.path.exists(os.path.join(self.dir, "session.graph.txt")))
 
 
+class TestToolSemantics(unittest.TestCase):
+    """File effects come from argument shapes, not tool names, so any harness works."""
+
+    def files(self, name, inp):
+        return dict(VCC.tool_files(name, inp))
+
+    def test_claude_code_tools(self):
+        self.assertEqual(self.files("Read", {"file_path": "/a.py"}), {"/a.py": False})
+        self.assertEqual(self.files("Write", {"file_path": "/a.py", "content": "x"}), {"/a.py": True})
+        self.assertEqual(self.files("Edit", {"file_path": "/a.py", "old_string": "a",
+                                             "new_string": "b"}), {"/a.py": True})
+        self.assertEqual(self.files("NotebookEdit", {"notebook_path": "/n.ipynb",
+                                                     "new_source": "x"}), {"/n.ipynb": True})
+        self.assertEqual(self.files("Grep", {"pattern": "x", "path": "/src"}), {})   # search scope
+        self.assertEqual(self.files("Bash", {"command": "ls"}), {})
+
+    def test_other_harness_shapes(self):
+        # Gemini CLI style
+        self.assertEqual(self.files("read_file", {"absolute_path": "/a.py"}), {"/a.py": False})
+        self.assertEqual(self.files("replace", {"file_path": "/a.py", "old_string": "a",
+                                                "new_string": "b"}), {"/a.py": True})
+        self.assertEqual(self.files("read_many_files", {"paths": ["/a.py", "/b.py"]}),
+                         {"/a.py": False, "/b.py": False})
+        # OpenCode style (camelCase, edit verb in the name)
+        self.assertEqual(self.files("edit", {"filePath": "/a.ts", "oldString": "a",
+                                             "newString": "b"}), {"/a.ts": True})
+        self.assertEqual(self.files("delete_file", {"path": "/old.txt"}), {"/old.txt": True})
+
+    def test_patch_text_anywhere_in_arguments(self):
+        patch = ("*** Begin Patch\n*** Update File: src/app.py\n@@\n-a\n+b\n"
+                 "*** Add File: src/new.py\n+x\n*** End Patch")
+        self.assertEqual(self.files("apply_patch", {"input": patch}),
+                         {"src/app.py": True, "src/new.py": True})
+        self.assertEqual(self.files("shell", {"command": ["apply_patch", patch]}),
+                         {"src/app.py": True, "src/new.py": True})
+        diff = "--- a/x.c\n+++ b/x.c\n@@ -1 +1 @@\n-a\n+b\n--- /dev/null\n+++ b/y.c\n"
+        self.assertEqual(self.files("run", {"diff": diff}), {"x.c": True, "y.c": True})
+
+    def test_summary_uses_argument_keys(self):
+        self.assertEqual(VCC._tool_summary("WebSearch", {"query": "bm25"}), '* WebSearch "bm25"')
+        self.assertEqual(VCC._tool_summary("shell", {"command": ["bash", "-lc", "pytest -q"]}),
+                         '* shell "pytest -q"')
+        files = VCC.tool_files("apply_patch", {"input": "*** Update File: a.py\n"})
+        self.assertEqual(VCC._tool_summary("apply_patch", {"input": "*** Update File: a.py\n"}, files),
+                         '* apply_patch "a.py"')
+
+
+def _write_jsonl(path, records):
+    with open(path, "w", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r) + "\n")
+
+
+class TestChatAdapter(VCCTestCase):
+    """Plain role/content JSONL (OpenAI-style tool_calls): the any-harness fallback."""
+
+    def setUp(self):
+        super().setUp()
+        _write_jsonl(self.jsonl, [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Fix the bug in util.py", "timestamp": "2026-06-01T10:00:00Z",
+             "cwd": "/w"},
+            {"role": "assistant", "content": "Looking.", "timestamp": "2026-06-01T10:00:02Z",
+             "tool_calls": [{"id": "call_1", "type": "function", "function": {
+                 "name": "write_file", "arguments": json.dumps({"path": "/w/util.py", "content": "ok"})}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "written",
+             "timestamp": "2026-06-01T10:00:03Z"},
+            {"role": "assistant", "content": [{"type": "text", "text": "Fixed util.py."}],
+             "timestamp": "2026-06-01T10:00:04Z"},
+        ])
+
+    def test_detect_and_compile(self):
+        recs, profile, harness = VCC.load(self.jsonl)
+        self.assertEqual(harness, "chat")
+        self.compile(graph=True)
+        full = "\n".join(self.read("session.txt"))
+        self.assertIn("[user] 2026-06-01 10:00Z", full)
+        self.assertIn(">>>tool_call write_file:call_1", full)
+        self.assertIn("[tool] write_file:call_1", full)
+        self.assertIn("M util.py", "\n".join(self.read("session.files.txt")))
+        self.assertIn('"Fix the bug in util.py"', "\n".join(self.read("session.graph.txt")))
+
+
+class TestGeminiAdapter(VCCTestCase):
+    """Gemini CLI session JSONL, per chatRecordingService.ts: metadata line, message lines
+    (repeated ids: last write wins, first write keeps position), $set/$patch/$rewindTo."""
+
+    def setUp(self):
+        super().setUp()
+        self.jsonl = os.path.join(self.dir, "session-2026-06-01T10-00-abcd1234.jsonl")
+        self.recs = [
+            {"sessionId": "s1", "projectHash": "h", "startTime": "2026-06-01T10:00:00Z",
+             "lastUpdated": "2026-06-01T10:00:00Z"},
+            {"id": "u1", "timestamp": "2026-06-01T10:00:00Z", "type": "user",
+             "content": [{"text": "Read config.toml and bump the version"}]},
+            {"$set": {"lastUpdated": "2026-06-01T10:00:01Z"}},
+            {"id": "g1", "timestamp": "2026-06-01T10:00:05Z", "type": "gemini", "content": "",
+             "thoughts": [{"subject": "Plan", "description": "Read then edit.",
+                           "timestamp": "2026-06-01T10:00:04Z"}],
+             "toolCalls": [{"id": "c1", "name": "read_file", "args": {"absolute_path": "/p/config.toml"},
+                            "status": "success", "timestamp": "2026-06-01T10:00:05Z"}]},
+            # same id re-appended (the full object, as pushMessage does) with a second call:
+            # replaces the first copy, keeps its position
+            {"id": "g1", "timestamp": "2026-06-01T10:00:05Z", "type": "gemini", "content": "",
+             "thoughts": [{"subject": "Plan", "description": "Read then edit.",
+                           "timestamp": "2026-06-01T10:00:04Z"}],
+             "model": "gemini-x", "tokens": {"input": 100, "output": 20, "cached": 40, "total": 120},
+             "toolCalls": [
+                 {"id": "c1", "name": "read_file", "args": {"absolute_path": "/p/config.toml"},
+                  "status": "success", "timestamp": "2026-06-01T10:00:05Z"},
+                 {"id": "c2", "name": "replace", "args": {"file_path": "/p/config.toml",
+                                                          "old_string": "1.0", "new_string": "1.1"},
+                  "status": "error", "timestamp": "2026-06-01T10:00:06Z"}]},
+            {"$patch": {"updates": [{"id": "g1", "toolCalls": [{"id": "c1", "result": [
+                {"functionResponse": {"id": "c1", "name": "read_file",
+                                      "response": {"output": "version = \"1.0\""}}}]}]}]}},
+            {"id": "g2", "timestamp": "2026-06-01T10:00:09Z", "type": "gemini",
+             "content": [{"text": "The edit failed; version is still 1.0."}]},
+            {"id": "u2", "timestamp": "2026-06-01T10:01:00Z", "type": "user",
+             "content": "never mind"},
+            {"$rewindTo": "u2"},       # user rewound: u2 is gone
+        ]
+        _write_jsonl(self.jsonl, self.recs)
+
+    def test_replay(self):
+        meta, msgs = VCC._gemini_messages(self.recs)
+        self.assertEqual([m["id"] for m in msgs], ["u1", "g1", "g2"])
+        self.assertEqual(len(msgs[1]["toolCalls"]), 2)
+        self.assertIsNotNone(msgs[1]["toolCalls"][0]["result"])
+
+    def test_compile(self):
+        recs, profile, harness = VCC.load(self.jsonl)
+        self.assertEqual(harness, "gemini-cli")
+        self.compile(graph=True)
+        stem = os.path.splitext(os.path.basename(self.jsonl))[0]
+        full = "\n".join(self.read(stem + ".txt"))
+        self.assertIn("[user] 2026-06-01 10:00Z", full)
+        self.assertIn("Read config.toml and bump the version", full)
+        self.assertIn("Plan\nRead then edit.", full)                 # thought -> thinking
+        self.assertIn('version = "1.0"', full)                       # patched-in tool result
+        self.assertIn("[tool_error] replace:c2", full)
+        self.assertNotIn("never mind", full)                         # rewound away
+        self.assertIn("model: gemini-x", full)                       # stats footer
+        self.assertIn("input: 60  cache_read: 40", full)
+        files = "\n".join(self.read(stem + ".files.txt"))
+        self.assertIn("R /p/config.toml", files)                     # the edit failed
+        graph = "\n".join(self.read(stem + ".graph.txt"))
+        self.assertIn("errors: replace", graph)
+
+    def test_legacy_single_json(self):
+        legacy = os.path.join(self.dir, "session-old.json")
+        with open(legacy, "w") as f:
+            json.dump({"sessionId": "s0", "projectHash": "h", "startTime": "x", "lastUpdated": "x",
+                       "messages": [{"id": "a", "timestamp": "2026-01-01T00:00:00Z", "type": "user",
+                                     "content": "hello from 2026"}]}, f, indent=2)
+        recs, profile, harness = VCC.load(legacy)
+        self.assertEqual(harness, "gemini-cli")
+        self.assertEqual(recs[0]["message"]["content"][0]["text"], "hello from 2026")
+
+
+class TestCodexAdapter(VCCTestCase):
+    """Codex CLI rollout lines {timestamp, type, payload}, per codex-rs protocol/history."""
+
+    PATCH = "*** Begin Patch\n*** Update File: src/app.py\n@@\n-x = 1\n+x = 2\n*** End Patch"
+
+    def setUp(self):
+        super().setUp()
+        self.jsonl = os.path.join(self.dir, "rollout-2026-06-01T10-00-00-abc.jsonl")
+
+        def line(ts, typ, payload):
+            return {"timestamp": f"2026-06-01T10:{ts}.000Z", "type": typ, "payload": payload}
+
+        def item(ts, payload):
+            return line(ts, "response_item", payload)
+
+        self.recs = [
+            line("00:00", "session_meta", {"id": "t1", "session_id": "t1", "timestamp": "x",
+                                           "cwd": "/repo", "originator": "codex_cli_rs",
+                                           "cli_version": "1.0.0", "model_provider": None,
+                                           "base_instructions": None}),
+            line("00:00", "turn_context", {"cwd": "/repo", "model": "gpt-x",
+                                           "approval_policy": "on-request",
+                                           "sandbox_policy": {"type": "workspace-write"}}),
+            item("00:01", {"type": "message", "role": "developer",
+                           "content": [{"type": "input_text", "text": "sandbox rules"}]}),
+            item("00:01", {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "<environment_context>\n<cwd>/repo</cwd>\n</environment_context>"}]}),
+            item("00:02", {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "Set x to 2 in src/app.py and run the tests"}]}),
+            line("00:02", "event_msg", {"type": "user_message", "message": "Set x to 2 ..."}),
+            item("00:03", {"type": "reasoning", "summary": [{"type": "summary_text",
+                                                             "text": "Need to patch app.py."}],
+                           "encrypted_content": "gAAA"}),
+            item("00:04", {"type": "function_call", "name": "shell", "call_id": "call_a",
+                           "arguments": json.dumps({"command": ["bash", "-lc", "cat src/app.py"]})}),
+            item("00:05", {"type": "function_call_output", "call_id": "call_a", "output": "x = 1\n"}),
+            item("00:06", {"type": "custom_tool_call", "name": "apply_patch", "call_id": "call_b",
+                           "input": self.PATCH}),
+            item("00:07", {"type": "custom_tool_call_output", "call_id": "call_b",
+                           "output": [{"type": "input_text", "text": "Success. Updated: src/app.py"}]}),
+            item("00:08", {"type": "function_call", "name": "shell", "call_id": "call_c",
+                           "arguments": json.dumps({"command": ["bash", "-lc", "pytest -q"]})}),
+            item("00:09", {"type": "function_call_output", "call_id": "call_c", "output": json.dumps(
+                {"output": "1 failed", "metadata": {"exit_code": 1, "duration_seconds": 0.5}})}),
+            item("00:10", {"type": "message", "role": "assistant", "phase": "final_answer",
+                           "content": [{"type": "output_text", "text": "Patched; one test fails."}]}),
+            line("00:11", "compacted", {"message": "Summary: x set to 2, a test fails.",
+                                        "replacement_history": [], "compaction_response_id": None,
+                                        "latest_token_usage_record": None}),
+            line("00:11", "event_msg", {"type": "context_compacted"}),
+            item("00:12", {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "Which test failed?"}]}),
+        ]
+        _write_jsonl(self.jsonl, self.recs)
+        self.stem = os.path.splitext(os.path.basename(self.jsonl))[0]
+
+    def test_detect(self):
+        recs, profile, harness = VCC.load(self.jsonl)
+        self.assertEqual(harness, "codex")
+        self.assertIs(profile, VCC.CODEX)
+
+    def test_compile_full_view(self):
+        self.compile(graph=True)
+        full = "\n".join(self.read(self.stem + "_1.txt"))     # split at the compaction
+        self.assertIn("[user] 2026-06-01 10:00Z", full)
+        self.assertIn(">>>thinking\nNeed to patch app.py.\n<<<thinking", full)
+        self.assertIn(">>>tool_call shell:call_a\ncommand:\n  - bash\n  - -lc\n  - cat src/app.py", full)
+        self.assertIn(">>>tool_call apply_patch:call_b\ninput: |", full)
+        self.assertIn("[tool_error] shell:call_c\n\n1 failed", full)      # exit_code 1
+        self.assertIn("Patched; one test fails.", full)
+        self.assertNotIn("Set x to 2 ...", full)                          # event_msg skipped
+        # consecutive assistant items (reasoning + call) share one section; tool outputs split them
+        self.assertEqual(full.count("[assistant]"), 4)
+        self.assertRegex(full, r"\[assistant\]\n\n>>>thinking\nNeed to patch app.py.\n<<<thinking\n\n"
+                               r">>>tool_call shell:call_a")
+        after = "\n".join(self.read(self.stem + "_2.txt"))
+        self.assertIn("[compact summary", after)
+        self.assertIn("Which test failed?", after)
+
+    def test_brief_and_views(self):
+        self.compile(graph=True)
+        brief = "\n".join(self.read(self.stem + "_1.min.txt"))
+        self.assertIn('* shell "cat src/app.py"', brief)
+        self.assertIn('* apply_patch "src/app.py"', brief)
+        self.assertNotIn("environment_context", brief)      # Codex profile strips injected context
+        self.assertNotIn("sandbox rules", brief)            # developer message = system section
+        files = "\n".join(self.read(self.stem + "_1.files.txt"))
+        self.assertIn("cwd: /repo", files)
+        self.assertIn("M src/app.py", files)
+        graph = "\n".join(self.read(self.stem + "_1.graph.txt"))
+        self.assertIn('"Set x to 2 in src/app.py and run the tests"', graph)
+        self.assertIn("errors: shell", graph)
+
+    def test_zst_input(self):
+        try:
+            from compression import zstd
+            compress = zstd.compress
+        except ImportError:
+            try:
+                import zstandard
+                compress = zstandard.ZstdCompressor().compress
+            except ImportError:
+                self.skipTest("no zstd codec available (needs Python 3.14+ or zstandard)")
+        zpath = self.jsonl + ".zst"
+        with open(self.jsonl, "rb") as f, open(zpath, "wb") as g:
+            g.write(compress(f.read()))
+        os.remove(self.jsonl)
+        res = VCC.compile_pass(zpath, quiet=True)
+        self.assertTrue(res[0][0].endswith(self.stem + "_1.txt"))
+
+
 class TestCLI(VCCTestCase):
     def run_cli(self, *args):
         return subprocess.run([sys.executable, os.path.join(SCRIPTS, "VCC.py"), self.jsonl, *args],

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""View-oriented Conversation Compiler (VCC) - compile Claude JSONL logs into adaptive views.
+"""View-oriented Conversation Compiler (VCC) - compile coding-agent logs into adaptive views.
+
+Input: Claude Code, Codex CLI and Gemini CLI session logs, or generic role/content chat
+JSONL (detected per file; --harness to override). See "input adapters" below.
 
 Produces per conversation chain:
   .txt       Full transcript (lossless rendering of JSONL)
@@ -154,8 +157,8 @@ def _parse_when(s, end=False):
     return d
 
 def lex(path):
-    with open(path, encoding="utf-8") as f:
-        return [json.loads(l) for l in f if l.strip()]
+    """Raw records of a log file (kept for compatibility; see load() for adapted records)."""
+    return load_records(path)
 
 
 def _collect_stats(chain):
@@ -254,18 +257,9 @@ def _sanitize(text):
         text = _ANSI_RE.sub("", text)
     return _CTRL_RE.sub("", text)
 
-def _preprocess_tool_text(text, tool_name):
+def _preprocess_tool_text(text, tool_name, profile=None):
     text = _sanitize(text)
-    if tool_name != "Read":
-        return text
-    lines = []
-    for line in text.split("\n"):
-        if "→" in line:
-            head, tail = line.split("→", 1)
-            if head.strip().isdigit():
-                line = tail
-        lines.append(line)
-    return "\n".join(lines)
+    return profile.fix_result(tool_name, text) if profile is not None else text
 
 def _discard(r):
     t = r.get("type")
@@ -310,6 +304,533 @@ def split_chains(recs):
     if cur: chains.append(cur)
     return chains
 
+# ── harness profiles ──
+#
+# Everything harness-specific about *rendering* lives in a Profile: which tools are
+# bookkeeping noise, which injected user text is harness chrome, and result fix-ups.
+# parse() applies a profile once (as node flags); all lowering passes are neutral.
+
+class Profile:
+    def __init__(self, name, noise_tools=(), strip_res=(), unwrap_re=None,
+                 meta_user_res=(), hide_exact=(), line_number_tools=()):
+        self.name = name
+        self.noise_tools = set(noise_tools)
+        self.strip_res = tuple(strip_res)
+        self.unwrap_re = unwrap_re
+        self.meta_user_res = tuple(meta_user_res)
+        self.hide_exact = set(hide_exact)
+        self.line_number_tools = set(line_number_tools)
+
+    def strip(self, text):
+        """User text with injected harness chrome removed (for brief mode)."""
+        for r in self.strip_res:
+            text = r.sub("", text)
+        if self.unwrap_re is not None:
+            text = self.unwrap_re.sub("", text)
+        return text.strip()
+
+    def is_meta(self, text):
+        """True if a user block is harness-generated (not typed by the user)."""
+        return any(r.match(text) for r in self.meta_user_res)
+
+    def fix_result(self, tool_name, text):
+        """Undo harness formatting of tool results (e.g. `  12→` line-number gutters)."""
+        if tool_name not in self.line_number_tools:
+            return text
+        lines = []
+        for line in text.split("\n"):
+            if "→" in line:
+                head, tail = line.split("→", 1)
+                if head.strip().isdigit():
+                    line = tail
+            lines.append(line)
+        return "\n".join(lines)
+
+GENERIC = Profile("chat")
+
+CLAUDE_CODE = Profile(
+    "claude-code",
+    noise_tools={"TodoWrite", "ToolSearch"},
+    strip_res=[re.compile(r'<(ide_opened_file|ide_selection|system-reminder|command-message)>'
+                          r'.*?</\1>\s*', re.DOTALL)],
+    unwrap_re=re.compile(r'</?(?:command-name|command-args)>'),
+    meta_user_res=[re.compile(r'^\s*<(?:task-notification|local-command-caveat'
+                              r'|local-command-stdout|local-command-stderr)\b'),
+                   re.compile(r'^Base directory for this skill:')],
+    hide_exact={"Continue from where you left off.", "No response requested."},
+    line_number_tools={"Read"},
+)
+
+GEMINI_CLI = Profile("gemini-cli")
+
+# Codex injects context as user-role messages. These tag names are not verified against a
+# current Codex release; if they are absent the rules simply never match.
+CODEX = Profile(
+    "codex",
+    noise_tools={"update_plan"},
+    strip_res=[re.compile(r'<(environment_context|user_instructions)>.*?</\1>\s*', re.DOTALL)],
+    meta_user_res=[re.compile(r'^# AGENTS\.md instructions for ')],
+)
+
+
+# ── input adapters ──
+#
+# Each harness's log is converted into one internal record model (the shape parse()
+# reads): {"type": "user"|"assistant"|"system", "timestamp", "cwd"?,
+#          "message": {"id"?, "content": str | [blocks], "usage"?, "model"?}}
+# with blocks text / thinking / tool_use{id,name,input} / tool_result{tool_use_id,
+# content, is_error} / image / document, plus {"type":"system","subtype":
+# "compact_boundary"} and {"type":"user","isCompactSummary":true} for compaction.
+# The "chat" adapter accepts plain role/content JSONL, so any harness can be
+# supported by exporting to it.
+
+def _read_bytes(path):
+    with open(path, "rb") as f:
+        raw = f.read()
+    if not path.endswith(".zst"):
+        return raw
+    try:                                  # Codex compresses rollouts older than 7 days
+        from compression import zstd      # Python 3.14+
+        return zstd.decompress(raw)
+    except ImportError:
+        pass
+    try:
+        import zstandard
+        return zstandard.ZstdDecompressor().decompressobj().decompress(raw)
+    except ImportError:
+        raise SystemExit(f"{path}: reading .zst needs Python 3.14+ or `pip install zstandard` "
+                         f"(or decompress first: zstd -d {path})")
+
+def load_records(path):
+    """Read a log file: JSONL, or a single JSON document (list of records or session object).
+
+    Works on bytes line by line: decoding a whole large log into one str is ~3x slower,
+    because a single non-ASCII character widens the entire string.
+    """
+    data = _read_bytes(path)
+    recs, bad = [], 0
+    for line in data.split(b"\n"):
+        if not line.strip():
+            continue
+        try:
+            recs.append(json.loads(line))
+        except ValueError:
+            bad += 1
+    if recs and not bad:
+        return recs
+    try:
+        doc = json.loads(data)
+    except ValueError:
+        if recs:
+            return recs          # JSONL with a few corrupt lines (e.g. a partial last line)
+        raise
+    if isinstance(doc, list):
+        return doc
+    if isinstance(doc, dict):
+        return [doc]
+    return []
+
+def detect_harness(recs):
+    """Name of the adapter for these records: codex, claude-code, gemini-cli or chat."""
+    dicts = [r for r in recs[:200] if isinstance(r, dict)]
+    if any(r.get("type") in _CODEX_TYPES and "payload" in r for r in dicts):
+        return "codex"
+    if any(r.get("type") in ("user", "assistant", "system") and isinstance(r.get("message"), dict)
+           for r in dicts) or any(r.get("type") in _DISCARD_T for r in dicts):
+        return "claude-code"
+    if any(("sessionId" in r and "projectHash" in r) or r.get("type") == "gemini"
+           or "$set" in r or "$patch" in r or "$rewindTo" in r for r in dicts):
+        return "gemini-cli"
+    if any("role" in r for r in dicts) or any(isinstance(r.get("messages"), list) for r in dicts):
+        return "chat"
+    return "claude-code"
+
+def _json_text(v):
+    if isinstance(v, str):
+        return v
+    try:
+        return json.dumps(v, ensure_ascii=False, indent=2)
+    except (TypeError, ValueError):
+        return str(v)
+
+def _args_dict(v):
+    """Tool arguments as a dict: JSON strings are decoded, other values wrapped."""
+    if isinstance(v, dict):
+        return v
+    if isinstance(v, str):
+        try:
+            d = json.loads(v)
+            if isinstance(d, dict):
+                return d
+        except ValueError:
+            pass
+        return {"input": v}
+    return {} if v is None else {"input": v}
+
+# -- generic chat (OpenAI / Anthropic style role+content messages) --
+
+_CHAT_ROLE = {"user": "user", "human": "user", "assistant": "assistant", "ai": "assistant",
+              "model": "assistant", "bot": "assistant", "system": "system",
+              "developer": "system"}
+
+def _chat_blocks(content):
+    if content is None:
+        return []
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}] if content else []
+    if isinstance(content, dict):
+        content = [content]
+    out = []
+    for b in content if isinstance(content, list) else []:
+        if isinstance(b, str):
+            out.append({"type": "text", "text": b})
+        elif isinstance(b, dict):
+            t = b.get("type")
+            if t in ("text", "input_text", "output_text") or (t is None and "text" in b):
+                out.append({"type": "text", "text": b.get("text", "")})
+            elif t in ("thinking", "redacted_thinking", "tool_use", "tool_result", "image", "document"):
+                out.append(b)
+            elif t in ("reasoning", "reasoning_text", "summary_text"):
+                out.append({"type": "thinking", "thinking": b.get("text", "")})
+            else:
+                out.append({"type": "text", "text": _json_text(b)})
+    return out
+
+def adapt_chat(recs):
+    msgs = []
+    for r in recs:
+        if isinstance(r, dict) and isinstance(r.get("messages"), list):
+            msgs.extend(m for m in r["messages"] if isinstance(m, dict))
+        elif isinstance(r, dict):
+            msgs.append(r)
+    out = []
+    for m in msgs:
+        role = _CHAT_ROLE.get(str(m.get("role", "")).lower())
+        ts = m.get("timestamp") or m.get("created_at") or m.get("time")
+        base = {"timestamp": ts if isinstance(ts, str) else None}
+        if isinstance(m.get("cwd"), str):
+            base["cwd"] = m["cwd"]
+        if m.get("role") in ("tool", "function"):
+            out.append({**base, "type": "user", "message": {"content": [{
+                "type": "tool_result", "tool_use_id": m.get("tool_call_id") or m.get("name", ""),
+                "content": _json_text(m.get("content", "")), "is_error": bool(m.get("is_error"))}]}})
+            continue
+        if role is None:
+            continue
+        blocks = _chat_blocks(m.get("content"))
+        if m.get("reasoning_content"):
+            blocks.insert(0, {"type": "thinking", "thinking": m["reasoning_content"]})
+        for tc in m.get("tool_calls") or []:
+            fn = tc.get("function") or {}
+            blocks.append({"type": "tool_use", "id": tc.get("id", ""),
+                           "name": fn.get("name") or tc.get("name", "tool"),
+                           "input": _args_dict(fn.get("arguments", tc.get("arguments", tc.get("input"))))})
+        out.append({**base, "type": role, "message": {"id": m.get("id"), "content": blocks}})
+    return out
+
+# -- Gemini CLI (~/.gemini/tmp/<project>/chats/session-*.jsonl, or legacy .json) --
+
+def _gemini_messages(recs):
+    """Replay the Gemini CLI session log: last write of a message id wins, first write
+    fixes its position; $patch / $rewindTo / $set lines are applied in order."""
+    from collections import OrderedDict
+    meta, msgs = {}, OrderedDict()
+    for r in recs:
+        if not isinstance(r, dict):
+            continue
+        if isinstance(r.get("messages"), list) and "sessionId" in r:   # legacy whole-file JSON
+            meta.update({k: v for k, v in r.items() if k != "messages"})
+            for m in r["messages"]:
+                if isinstance(m, dict) and isinstance(m.get("id"), str):
+                    msgs[m["id"]] = m
+        elif "$rewindTo" in r:
+            ids = list(msgs)
+            cut = ids.index(r["$rewindTo"]) if r["$rewindTo"] in msgs else 0
+            for k in ids[cut:]:
+                del msgs[k]
+        elif "$patch" in r:
+            pt = r["$patch"] if isinstance(r["$patch"], dict) else {}
+            ups = list(pt.get("updates") or [])
+            if pt.get("id"):
+                ups.insert(0, pt)
+            for u in ups:
+                m = msgs.get(u.get("id"))
+                if m is None:
+                    continue
+                m = dict(m)
+                if "content" in u:
+                    m["content"] = u["content"]
+                if isinstance(u.get("toolCalls"), list) and isinstance(m.get("toolCalls"), list):
+                    res = {tc.get("id"): tc for tc in u["toolCalls"] if isinstance(tc, dict)}
+                    m["toolCalls"] = [dict(tc, result=res[tc.get("id")].get("result"))
+                                      if tc.get("id") in res else tc for tc in m["toolCalls"]]
+                msgs[m["id"]] = m
+            for k in pt.get("removeIds") or []:
+                msgs.pop(k, None)
+            for k in pt.get("orderIds") or []:
+                if k in msgs:
+                    msgs.move_to_end(k)
+        elif "$set" in r:
+            st = r["$set"] if isinstance(r["$set"], dict) else {}
+            if isinstance(st.get("messages"), list):
+                msgs = OrderedDict((m["id"], m) for m in st["messages"]
+                                   if isinstance(m, dict) and isinstance(m.get("id"), str))
+            meta.update({k: v for k, v in st.items() if k != "messages"})
+        elif isinstance(r.get("id"), str):
+            msgs[r["id"]] = r
+        elif "sessionId" in r:
+            meta.update(r)
+    return meta, list(msgs.values())
+
+def _gemini_parts(content):
+    if content is None:
+        return []
+    if isinstance(content, (str, dict)):
+        content = [content]
+    return [p for p in content if isinstance(p, (str, dict))] if isinstance(content, list) else []
+
+def _gemini_response_text(parts):
+    out = []
+    for p in _gemini_parts(parts):
+        if isinstance(p, str):
+            out.append(p)
+        elif "functionResponse" in p:
+            resp = (p["functionResponse"] or {}).get("response")
+            if isinstance(resp, dict) and set(resp) <= {"output", "error"}:
+                out.extend(_json_text(v) for v in resp.values())
+            else:
+                out.append(_json_text(resp))
+        elif "text" in p:
+            out.append(p["text"])
+    return "\n".join(out)
+
+def adapt_gemini(recs):
+    meta, msgs = _gemini_messages(recs)
+    answered = {tc.get("id") for m in msgs for tc in (m.get("toolCalls") or [])
+                if isinstance(tc, dict) and tc.get("result") is not None}
+    cwd = (meta.get("directories") or [None])[0] if isinstance(meta.get("directories"), list) else None
+    out = []
+    for m in msgs:
+        ts, typ = m.get("timestamp"), m.get("type")
+        base = {"timestamp": ts, **({"cwd": cwd} if cwd else {})}
+        parts = _gemini_parts(m.get("content"))
+        texts = [p if isinstance(p, str) else p["text"] for p in parts
+                 if isinstance(p, str) or ("text" in p and not p.get("thought"))]
+        text = "\n".join(t for t in texts if t)
+        if typ == "user":
+            blocks = [{"type": "text", "text": text}] if text else []
+            for p in parts:   # tool responses not already attached to a recorded tool call
+                fr = p.get("functionResponse") if isinstance(p, dict) else None
+                if fr and fr.get("id") not in answered:
+                    blocks.append({"type": "tool_result", "tool_use_id": fr.get("id", ""),
+                                   "content": _gemini_response_text([p])})
+            if blocks:
+                out.append({**base, "type": "user", "message": {"content": blocks}})
+        elif typ == "gemini":
+            blocks = []
+            for th in m.get("thoughts") or []:
+                if isinstance(th, dict):
+                    t = "\n".join(x for x in (th.get("subject"), th.get("description")) if x)
+                    if t:
+                        blocks.append({"type": "thinking", "thinking": t})
+            blocks += [{"type": "thinking", "thinking": p["text"]} for p in parts
+                       if isinstance(p, dict) and p.get("thought") and p.get("text")]
+            if text:
+                blocks.append({"type": "text", "text": text})
+            calls = [tc for tc in (m.get("toolCalls") or []) if isinstance(tc, dict)]
+            if not calls:
+                calls = [dict(p["functionCall"], args=p["functionCall"].get("args"))
+                         for p in parts if isinstance(p, dict) and isinstance(p.get("functionCall"), dict)]
+            for tc in calls:
+                blocks.append({"type": "tool_use", "id": tc.get("id", ""), "name": tc.get("name", "tool"),
+                               "input": _args_dict(tc.get("args"))})
+            msg = {"id": m.get("id"), "content": blocks}
+            tok = m.get("tokens")
+            if isinstance(tok, dict):
+                cached = tok.get("cached", 0) or 0
+                msg["usage"] = {"input_tokens": max((tok.get("input", 0) or 0) - cached, 0),
+                                "cache_read_input_tokens": cached,
+                                "output_tokens": tok.get("output", 0) or 0}
+            if m.get("model"):
+                msg["model"] = m["model"]
+            if blocks:
+                out.append({**base, "type": "assistant", "message": msg})
+            results = []
+            for tc in calls:
+                res = tc.get("result")
+                body = _gemini_response_text(res) if res is not None else (
+                    tc.get("resultDisplay") if isinstance(tc.get("resultDisplay"), str) else None)
+                status = tc.get("status")
+                if body is None and status not in ("error", "cancelled"):
+                    continue
+                results.append({"type": "tool_result", "tool_use_id": tc.get("id", ""),
+                                "content": body or f"[{status}]",
+                                "is_error": status in ("error", "cancelled")})
+            if results:
+                out.append({"timestamp": ts, **({"cwd": cwd} if cwd else {}),
+                            "type": "user", "message": {"content": results}})
+        elif typ in ("info", "error", "warning") and text:
+            out.append({**base, "type": "system", "content": f"[{typ}] {text}"})
+    return out
+
+_CODEX_TYPES = {"session_meta", "response_item", "event_msg", "turn_context", "compacted"}
+
+def _codex_text(items):
+    """Text of Codex content items / function output (string or item array)."""
+    if isinstance(items, str):
+        return items
+    out = []
+    for it in items if isinstance(items, list) else []:
+        if isinstance(it, dict) and isinstance(it.get("text"), str):
+            out.append(it["text"])
+        elif isinstance(it, dict) and it.get("type") in ("input_image", "output_image"):
+            out.append("[image]")
+    return "\n".join(out)
+
+def _codex_content_blocks(content):
+    blocks = []
+    for it in content if isinstance(content, list) else []:
+        if not isinstance(it, dict):
+            continue
+        if isinstance(it.get("text"), str) and it["text"]:
+            blocks.append({"type": "text", "text": it["text"]})
+        elif it.get("type") == "input_image":
+            url = it.get("image_url") or ""
+            m = re.match(r"data:([\w/+.-]+);base64,(.*)$", url, re.S)
+            if m:
+                blocks.append({"type": "image", "source": {"type": "base64",
+                               "media_type": m.group(1), "data": m.group(2)}})
+            else:
+                blocks.append({"type": "text", "text": f"[image: {url or it.get('file_id', '')}]"})
+    return blocks
+
+def _codex_output(out):
+    """(text, is_error) of a function/custom tool output. The rollout does not record
+    success; older shell outputs are JSON with metadata.exit_code, which is used if present."""
+    text = _codex_text(out)
+    try:
+        d = json.loads(text) if text.lstrip().startswith("{") else None
+    except ValueError:
+        d = None
+    if isinstance(d, dict) and isinstance(d.get("output"), str):
+        code = (d.get("metadata") or {}).get("exit_code")
+        return d["output"], isinstance(code, int) and code != 0
+    return text, False
+
+def adapt_codex(recs):
+    """Codex CLI rollout (~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl[.zst]).
+
+    Lines are {timestamp, type, payload}. response_item payloads carry the conversation;
+    event_msg lines duplicate it for the UI and are skipped; `compacted` carries the
+    compaction summary.
+    """
+    out, cwd, model, turn, n_anon = [], None, None, 0, 0
+    asst_open = False
+
+    def emit(rtype, ts, msg=None, **extra):
+        rec = {"type": rtype, "timestamp": ts, **extra}
+        if cwd:
+            rec["cwd"] = cwd
+        if msg is not None:
+            rec["message"] = msg
+        out.append(rec)
+
+    def asst(ts, blocks):
+        nonlocal turn, asst_open
+        if not asst_open:
+            turn += 1
+            asst_open = True
+        msg = {"id": f"codex-{turn}", "content": blocks}
+        if model:
+            msg["model"] = model
+        emit("assistant", ts, msg)
+
+    for r in recs:
+        if not isinstance(r, dict):
+            continue
+        typ, ts, pl = r.get("type"), r.get("timestamp"), r.get("payload")
+        if not isinstance(pl, dict):
+            continue
+        if typ in ("session_meta", "turn_context"):
+            cwd = pl.get("cwd") if isinstance(pl.get("cwd"), str) else cwd
+            model = pl.get("model") if isinstance(pl.get("model"), str) else model
+            continue
+        if typ == "compacted":
+            asst_open = False
+            emit("system", ts, subtype="compact_boundary")
+            emit("user", ts, {"content": pl.get("message") or ""}, isCompactSummary=True)
+            continue
+        if typ != "response_item":
+            continue
+        it = pl.get("type")
+        if it == "message":
+            role = pl.get("role")
+            blocks = _codex_content_blocks(pl.get("content"))
+            if not blocks:
+                continue
+            if role == "assistant":
+                asst(ts, blocks)
+            elif role in ("developer", "system"):
+                asst_open = False
+                emit("system", ts, content="\n".join(b.get("text", "") for b in blocks))
+            else:
+                asst_open = False
+                emit("user", ts, {"content": blocks})
+        elif it == "reasoning":
+            text = "\n".join(_codex_text(pl.get(k)) for k in ("summary", "content") if pl.get(k))
+            if text.strip():
+                asst(ts, [{"type": "thinking", "thinking": text}])
+            elif pl.get("encrypted_content"):
+                asst(ts, [{"type": "redacted_thinking"}])
+        elif it in ("function_call", "custom_tool_call", "local_shell_call",
+                    "web_search_call", "tool_search_call"):
+            cid = pl.get("call_id") or pl.get("id")
+            if not cid:
+                n_anon += 1
+                cid = f"codex-call-{n_anon}"
+            if it == "function_call":
+                name = pl.get("name") or "function"
+                if pl.get("namespace"):
+                    name = f"{pl['namespace']}.{name}"
+                inp = _args_dict(pl.get("arguments"))
+            elif it == "custom_tool_call":
+                name, inp = pl.get("name") or "custom_tool", _args_dict(pl.get("input"))
+            elif it == "local_shell_call":
+                name, inp = "local_shell", pl.get("action") or {}
+            elif it == "web_search_call":
+                name, inp = "web_search", pl.get("action") or {}
+            else:
+                name, inp = "tool_search", _args_dict(pl.get("arguments"))
+            asst(ts, [{"type": "tool_use", "id": cid, "name": name, "input": inp}])
+        elif it in ("function_call_output", "custom_tool_call_output", "tool_search_output"):
+            asst_open = False
+            text, err = _codex_output(pl.get("output"))
+            emit("user", ts, {"content": [{"type": "tool_result", "tool_use_id": pl.get("call_id") or "",
+                                           "content": text, "is_error": err}]})
+        elif it == "image_generation_call":
+            asst(ts, [{"type": "text", "text": f"[image generation] {pl.get('revised_prompt') or ''}".strip()}])
+        elif it == "agent_message":
+            asst_open = False
+            emit("system", ts, content=f"[agent message {pl.get('author', '?')} -> "
+                                       f"{pl.get('recipient', '?')}] {_codex_text(pl.get('content'))}")
+    return out
+
+ADAPTERS = {
+    "claude-code": (lambda recs: recs, CLAUDE_CODE),
+    "codex": (adapt_codex, CODEX),
+    "gemini-cli": (adapt_gemini, GEMINI_CLI),
+    "chat": (adapt_chat, GENERIC),
+}
+
+def load(path, harness="auto"):
+    """Read any supported log and return (records in the internal model, profile, harness)."""
+    recs = load_records(path)
+    if harness == "auto":
+        harness = detect_harness(recs)
+    adapt, profile = ADAPTERS[harness]
+    return adapt(recs), profile, harness
+
+
 # ── image / doc ──
 
 def _media_ext(media_type, default_ext):
@@ -336,29 +857,84 @@ def _extract_doc(source, outdir, data_prefix, data_index):
                            "doc", "application/octet-stream", "bin")
 
 
-# ── tool_call summary ──
+# ── tool semantics (harness-neutral) ──
+#
+# What a tool call does is read from the *shape* of its arguments, never from tool
+# names, so summaries and the files/graph views work for any harness:
+#   - a path-like argument (file_path, path, filePath, ...) = the call touches that file,
+#     unless the call also has a search argument (then the path is just a search scope);
+#   - content/edit/patch arguments, or an edit verb in the tool name = it modifies the file;
+#   - patch text in any argument (`*** Update File: x`, `+++ b/x`) names modified files.
 
-_TOOL_SUMMARY_FIELDS = {
-    "Read": "file_path", "Edit": "file_path", "Write": "file_path",
-    "Glob": "pattern", "Grep": "pattern",
-    "Agent": "description", "Skill": "skill",
-}
-# Tools whose input names a file; used by the files view.
-_FILE_TOOLS = {"Read", "Write", "Edit", "MultiEdit", "NotebookEdit"}
-_FILE_WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+_SUMMARY_KEYS = ("description", "file_path", "notebook_path", "filePath", "absolute_path",
+                 "target_file", "pattern", "query", "url", "path", "command", "cmd",
+                 "skill", "prompt")
+_SUMMARY_SHORTEN = {"command", "cmd", "query", "prompt", "url"}
+_PATH_KEYS = ("file_path", "filePath", "filepath", "notebook_path", "absolute_path",
+              "target_file", "file", "filename", "path")
+_PATH_LIST_KEYS = ("paths", "file_paths", "files")
+_SCOPE_KEYS = ("pattern", "query", "regex", "glob", "include")
+_MODIFY_KEYS = ("content", "contents", "file_text", "new_string", "old_string", "new_str",
+                "old_str", "newString", "oldString", "edits", "patch", "diff", "new_source")
+_MODIFY_VERB_RE = re.compile(r"write|edit|patch|replace|create|delete|remove|rename|move"
+                             r"|insert|append|save", re.I)
+_PATCH_FILE_RE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+?)\s*$"
+                            r"|^\*\*\* Move to: (.+?)\s*$"
+                            r"|^\+\+\+ (?:b/)?(\S+)", re.M)
 
-def _tool_summary(name, inp):
-    """Build one-line summary: * Name "param" """
-    field = _TOOL_SUMMARY_FIELDS.get(name)
-    if field and field in inp:
-        return f'* {name} "{inp[field]}"'
-    if name == "Bash":
-        val = inp.get("description") or inp.get("command", "")
-        if val:
-            # truncate long commands
-            if not inp.get("description") and len(val) > 60:
-                val = val[:57] + "..."
-            return f'* {name} "{val}"'
+def _is_pathlike(v):
+    return isinstance(v, str) and 0 < len(v) < 4096 and "\n" not in v and v.strip() == v
+
+def _strings_in(v, depth=0):
+    if isinstance(v, str):
+        yield v
+    elif depth < 3 and isinstance(v, dict):
+        for x in v.values():
+            yield from _strings_in(x, depth + 1)
+    elif depth < 3 and isinstance(v, list):
+        for x in v:
+            yield from _strings_in(x, depth + 1)
+
+def tool_files(name, inp):
+    """[(path, modifies)] for one tool call, from the shape of its arguments."""
+    if not isinstance(inp, dict):
+        return []
+    out = {}
+    for s in _strings_in(inp):
+        if "*** " in s or "+++ " in s:
+            for m in _PATCH_FILE_RE.finditer(s):
+                p = next(g for g in m.groups() if g)
+                if p != "/dev/null":
+                    out[p] = True
+    if not any(k in inp for k in _SCOPE_KEYS):
+        modifies = any(k in inp for k in _MODIFY_KEYS) or bool(_MODIFY_VERB_RE.search(name or ""))
+        paths = [inp[k] for k in _PATH_KEYS if _is_pathlike(inp.get(k))][:1]
+        for k in _PATH_LIST_KEYS:
+            if isinstance(inp.get(k), list):
+                paths += [p for p in inp[k] if _is_pathlike(p)]
+        for p in paths:
+            out[p] = out.get(p, False) or modifies
+    return list(out.items())
+
+def _shell_text(v):
+    """A command given as an argv list -> one string (`bash -lc "x"` -> `x`)."""
+    if isinstance(v, list) and v and all(isinstance(x, str) for x in v):
+        if len(v) >= 3 and os.path.basename(v[0]) in ("bash", "sh", "zsh") and v[1] in ("-lc", "-c"):
+            return v[-1]
+        return " ".join(v)
+    return v
+
+def _tool_summary(name, inp, files=None):
+    """Build one-line summary: * Name "param" (first descriptive argument, by key name)."""
+    if isinstance(inp, dict):
+        for k in _SUMMARY_KEYS:
+            v = _shell_text(inp.get(k))
+            if isinstance(v, str) and v.strip():
+                if k in _SUMMARY_SHORTEN and len(v) > 60:
+                    v = v[:57] + "..."
+                return f'* {name} "{v}"'
+    if files:
+        return f'* {name} "{files[0][0]}"' + (f" (+{len(files) - 1} files)" if len(files) > 1 else "")
     return f"* {name}"
 
 
@@ -372,7 +948,8 @@ def _node(typ, content, **kw):
 
 # ── parser ──
 
-def parse(chain, outdir, data_prefix, data_ctr):
+def parse(chain, outdir, data_prefix, data_ctr, profile=None):
+    profile = profile or GENERIC
     ir = []
     sec = 0
     blk = 0
@@ -425,13 +1002,12 @@ def parse(chain, outdir, data_prefix, data_ctr):
                 tid = b.get("id", "")
                 inp = b.get("input", {})
                 hl = f">>>tool_call {name}:{_short_tid(tid)}"
-                summary = _tool_summary(name, inp)
-                fpath = None
-                if name in _FILE_TOOLS and isinstance(inp, dict):
-                    fpath = inp.get("file_path") or inp.get("notebook_path")
+                files = tool_files(name, inp)
+                summary = _tool_summary(name, inp, files)
                 ir.append(_node("meta", [hl], _sec=sec, _blk=blk,
                                  _tool_summary=summary, _tool_name=name,
-                                 _tool_tid=_short_tid(tid), _tool_file=fpath))
+                                 _tool_tid=_short_tid(tid), _tool_files=files,
+                                 _noise_tool=name in profile.noise_tools))
                 if inp:
                     ir.append(_node("tool_call", _emit_dict(inp).split("\n"),
                                      searchable=True, _sec=sec, _blk=blk))
@@ -525,11 +1101,11 @@ def parse(chain, outdir, data_prefix, data_ctr):
                     tc = tr.get("content", "")
                     parts = []
                     if isinstance(tc, str):
-                        parts.append(_preprocess_tool_text(tc, nm))
+                        parts.append(_preprocess_tool_text(tc, nm, profile))
                     elif isinstance(tc, list):
                         for item in tc:
                             if item.get("type") == "text":
-                                parts.append(_preprocess_tool_text(item.get("text", ""), nm))
+                                parts.append(_preprocess_tool_text(item.get("text", ""), nm, profile))
                             elif item.get("type") == "image":
                                 src = item.get("source", {})
                                 if src.get("type") == "base64":
@@ -564,7 +1140,22 @@ def parse(chain, outdir, data_prefix, data_ctr):
     for o in ir[stamp_from:]:
         o.setdefault("_ts", cur_ts)
     ir.append(_node("meta", [""]))  # trailing newline
+    _annotate(ir, profile)
     return ir
+
+def _annotate(ir, profile):
+    """Apply the harness profile's noise rules once, as flags read by the lowering passes."""
+    for o in ir:
+        if not o.get("searchable"):
+            continue
+        t = o["type"]
+        if t == "user" or t.startswith("user_"):
+            text = "\n".join(o["content"]).strip()
+            o["_meta_user"] = profile.is_meta(text)
+            o["_brief_text"] = profile.strip(text)
+        if (profile.hide_exact and t not in ("thinking", "redacted_thinking")
+                and sum(len(l) for l in o["content"]) < 256):
+            o["_hide_exact"] = "\n".join(o["content"]).strip() in profile.hide_exact
 
 
 # ── IR walk ──
@@ -646,23 +1237,13 @@ def _sec_roles(ir):
 
 
 # ── brief-mode filtering ──
+# Harness-specific noise rules live in Profile (see "harness profiles"); parse() applies
+# them once as node flags (_brief_text, _meta_user, _hide_exact, _noise_tool), so the
+# lowering passes below are harness-neutral.
 
-_BRIEF_STRIP_RE = re.compile(
-    r'<(ide_opened_file|ide_selection|system-reminder|command-message)>.*?</\1>\s*',
-    re.DOTALL)
-_BRIEF_UNWRAP_RE = re.compile(r'</?(?:command-name|command-args)>')
-_META_USER_RE = re.compile(
-    r'^\s*<(?:task-notification|local-command-caveat|local-command-stdout'
-    r'|local-command-stderr)\b')
-_SKILL_USER_RE = re.compile(r'^Base directory for this skill:')
-_BRIEF_HIDE_TOOLS = {"TodoWrite", "ToolSearch"}
-_BRIEF_HIDE_EXACT = {"Continue from where you left off.", "No response requested."}
-
-def _strip_noise_xml(text):
-    """Strip known noise XML from user text for brief mode."""
-    text = _BRIEF_STRIP_RE.sub('', text)
-    text = _BRIEF_UNWRAP_RE.sub('', text)
-    return text.strip()
+def _brief_text(o):
+    """User text as brief mode shows it (harness noise stripped)."""
+    return o["_brief_text"] if "_brief_text" in o else "\n".join(o["content"]).strip()
 
 def _searchable_by_sec(ir):
     """Map sec -> its searchable nodes, in IR order (built once per lowering)."""
@@ -683,11 +1264,9 @@ def _user_hidden_in_brief(ir, sec, by_sec=None):
         text = "\n".join(o["content"]).strip()
         if not text:
             continue
-        if _META_USER_RE.match(text):
+        if o.get("_meta_user"):
             continue
-        if _SKILL_USER_RE.match(text):
-            continue
-        if not _strip_noise_xml(text):
+        if not _brief_text(o):
             continue
         return False
     return True
@@ -701,8 +1280,7 @@ def _section_hidden_exact(ir, sec, by_sec=None):
     if not blocks:
         return False
     for o in blocks:
-        text = "\n".join(o["content"]).strip()
-        if text not in _BRIEF_HIDE_EXACT:
+        if not o.get("_hide_exact"):
             return False
     return True
 
@@ -849,8 +1427,7 @@ def lower_brief(ir, truncate, filename="", truncate_user=256):
             c0 = o["content"][0]
             if c0.startswith(">>>tool_call"):
                 # Hide noise tools (internal bookkeeping)
-                tool_name = c0.split()[1].split(":")[0] if len(c0.split()) > 1 else ""
-                if tool_name in _BRIEF_HIDE_TOOLS:
+                if o.get("_noise_tool"):
                     o["content_brief"] = None
                     continue
                 summary = o.get("_tool_summary", f"* unknown")
@@ -897,7 +1474,7 @@ def lower_brief(ir, truncate, filename="", truncate_user=256):
             ref = f"{short}:{node_start}-{node_end}"
             text = "\n".join(o["content"])
             if o["type"] == "user":
-                text = _strip_noise_xml(text)
+                text = _brief_text(o)
                 if not text.strip():
                     o["content_brief"] = None
                     continue
@@ -953,11 +1530,11 @@ def _disp_path(p, cwd):
     return p
 
 def lower_files(ir, filename="", cwd=None):
-    """Files view: every file touched by a file tool, with pointers into the full view.
+    """Files view: every file a tool call touched, with pointers into the full view.
 
-    Deterministic (no LLM). Lists, per file, each Read/Write/Edit call with its
-    (call, result) line ranges, newest-touched file first, and marks files that a
-    successful write tool modified. Returns a list of lines, or None if no file was touched.
+    Deterministic (no LLM), harness-neutral (see tool_files). Lists, per file, each call
+    with its (call, result) line ranges, newest-touched file first, and marks files that
+    a successful modifying call changed. Returns a list of lines, or None if none.
     """
     short = _short(filename)
     tid_ranges = _tid_result_ranges(ir)
@@ -966,28 +1543,29 @@ def lower_files(ir, filename="", cwd=None):
 
     files = {}   # path -> {"ops": [...], "last": idx, "modified": bool}
     for idx, o in enumerate(ir):
-        path = o.get("_tool_file")
-        if not path:
+        if not o.get("_tool_files"):
             continue
         name, tid = o.get("_tool_name", "?"), o.get("_tool_tid", "")
         ref = _call_ref(o, blk_range, tid_ranges)
         err = tid in err_tids
-        f = files.setdefault(path, {"ops": [], "last": idx, "last_op": name,
-                                    "last_ts": None, "modified": False})
-        f["ops"].append(f"  {name:<12} ({short}:{ref})" + (" error" if err else ""))
-        f["last"], f["last_op"], f["last_ts"] = idx, name, o.get("_ts")
-        if name in _FILE_WRITE_TOOLS and not err:
-            f["modified"] = True
+        for path, mod in o["_tool_files"]:
+            f = files.setdefault(path, {"ops": [], "last": idx, "last_op": name,
+                                        "last_ts": None, "modified": False})
+            f["ops"].append(f"  {name:<12} ({short}:{ref})" + (" error" if err else ""))
+            f["last"], f["last_op"], f["last_ts"] = idx, name, o.get("_ts")
+            if mod and not err:
+                f["modified"] = True
     if not files:
         return None
 
     nmod = sum(1 for f in files.values() if f["modified"])
     out = [f"[files] {len(files)} file(s) touched, {nmod} modified "
-           f"(M = modified by a write tool here, R = read only)"]
+           f"(M = modified by a tool call here, R = read only)"]
     if cwd:
         out.append(f"cwd: {cwd}")
     out.append(f"Pointers are (call, result) line ranges in {short}. Newest-touched first.")
-    out.append("Changes made via Bash or outside this session are NOT tracked: re-read files before relying on them.")
+    out.append("Changes made by shell commands or outside this session are NOT tracked: "
+               "re-read files before relying on them.")
     for path, f in sorted(files.items(), key=lambda kv: -kv[1]["last"]):
         ts = _fmt_ts(f["last_ts"])
         out.append("")
@@ -1027,8 +1605,7 @@ def build_turns(ir):
         hdr = sec_header.get(sec) if sec is not None else None
         text = ""
         if sec is not None:
-            raw = "\n".join("\n".join(o["content"]) for o in by_sec.get(sec, []))
-            text = _strip_noise_xml(raw) or ""
+            text = "\n".join(t for t in (_brief_text(o) for o in by_sec.get(sec, [])) if t)
             if not text and hdr is not None:   # e.g. a compact summary placeholder
                 text = "\n".join(o["content"][0] for o in ir
                                  if o.get("_sec") == sec and o["type"] == "user")
@@ -1066,27 +1643,27 @@ def build_turns(ir):
         if not name or o.get("_sec") is None:
             continue
         t = _turn_for(o["_sec"])
-        if name not in _BRIEF_HIDE_TOOLS:
+        if not o.get("_noise_tool"):
             t["tools"][name] = t["tools"].get(name, 0) + 1
         tid = o.get("_tool_tid", "")
         err = tid in errs
         if err:
             rr = tid_ranges.get(tid)
             t["errors"].append((name, f"{rr[0]+1}-{rr[1]+1}" if rr else "?"))
-        path = o.get("_tool_file")
-        if path:
-            t["files"].setdefault(path, []).append((name, err, _call_ref(o, blk_range, tid_ranges)))
+        for path, mod in o.get("_tool_files") or ():
+            t["files"].setdefault(path, []).append(
+                (name, err, _call_ref(o, blk_range, tid_ranges), mod))
     if pre["tools"] or pre["errors"]:
         turns.insert(0, pre)
     return turns
 
 def _file_status(ops):
-    return "M" if any(n in _FILE_WRITE_TOOLS and not e for n, e, _ in ops) else "R"
+    return "M" if any(mod and not err for _, err, _, mod in ops) else "R"
 
 def _ops_str(ops):
     """'Read(error), Edit x4': consecutive identical operations are collapsed."""
     runs = []
-    for n, e, _ in ops:
+    for n, e, *_ in ops:
         key = n + ("(error)" if e else "")
         if runs and runs[-1][0] == key:
             runs[-1][1] += 1
@@ -1136,7 +1713,8 @@ def lower_graph(ir, filename="", cwd=None, turns=None):
     if cwd:
         head.append(f"cwd: {cwd}")
     head.append("T = user turn (its message and the work it triggered). M/R = modified/read in that turn.")
-    head.append("[prev Tn] = the last earlier turn that touched the same file. Bash file changes are not tracked.")
+    head.append("[prev Tn] = the last earlier turn that touched the same file. "
+                "File changes made by shell commands are not tracked.")
     tail = []
     if file_turns:
         tail = ["", "[files -> turns]"]
@@ -1405,13 +1983,17 @@ def grep_search(results, pattern, keep=None, limit=0, rank=False):
 # ── compile ──
 
 def compile_pass(input_path, output_dir=None, truncate=128, truncate_user=256,
-            grep_pattern=None, quiet=False, keep=None, graph=False):
+            grep_pattern=None, quiet=False, keep=None, graph=False, harness="auto"):
     if output_dir is None:
         output_dir = os.path.dirname(os.path.abspath(input_path)) or "."
     os.makedirs(output_dir, exist_ok=True)
-    base = os.path.splitext(os.path.basename(input_path))[0]
+    base = os.path.basename(input_path)
+    if base.endswith(".zst"):
+        base = base[:-4]
+    base = os.path.splitext(base)[0]
 
-    recs = merge_chunks(lex(input_path))
+    recs, profile, _ = load(input_path, harness)
+    recs = merge_chunks(recs)
     chains = split_chains(recs)
     if not chains:
         if not quiet:
@@ -1433,7 +2015,7 @@ def compile_pass(input_path, output_dir=None, truncate=128, truncate_user=256,
         filesp = os.path.join(output_dir, filesfn)
         data_ctr = [0]
 
-        ir = parse(chain, output_dir, f"{base}{sfx}", data_ctr)
+        ir = parse(chain, output_dir, f"{base}{sfx}", data_ctr, profile)
         assign_lines(ir)
         lower_brief(ir, truncate, ffn, truncate_user)
 
@@ -1518,6 +2100,10 @@ def main():
     p.add_argument("--rank", action="store_true",
                    help="with --grep: order hits by BM25 relevance to the pattern's words "
                         "instead of newest first (use an alternation of synonyms as the query)")
+    p.add_argument("--harness", default="auto",
+                   choices=["auto", "claude-code", "codex", "gemini-cli", "chat"],
+                   help="log format (default: detect per file). 'chat' = JSONL of "
+                        "{role, content, tool_calls?} messages, for any other harness")
     p.add_argument("--graph", action="store_true",
                    help="also write .graph.txt (user turns <-> files touched); with several "
                         "conversations, print a cross-conversation file index")
@@ -1541,7 +2127,8 @@ def main():
         if since is not None and os.path.exists(f) and os.path.getmtime(f) < since.timestamp():
             continue
         res = compile_pass(f, a.output_dir, a.truncate, a.truncate_user,
-                      a.grep, quiet=bool(a.grep), keep=keep, graph=a.graph)
+                      a.grep, quiet=bool(a.grep), keep=keep, graph=a.graph,
+                      harness=a.harness)
         all_results.extend(res)
     if a.graph and len(all_results) > 1:
         idx = graph_index([(fp, cwd, turns) for fp, _, cwd, turns in all_results])

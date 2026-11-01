@@ -8,7 +8,7 @@ Official implementation of "View-oriented Conversation Compiler for Agent Trace 
 
 This repo is for daily use. To reproduce academic experiments in the paper, see [VCC-experiments](https://github.com/lllyasviel/VCC-experiments).
 
-VCC is a compiler that compiles your conversation logs (Claude Code's JSONL) into efficient and agent-friendly views. Then you will never fear Claude Code's `/compact` - CC now can finally see the original details of compacted context. It also supports searching across all your Claude Code conversations.
+VCC is a compiler that compiles your conversation logs (Claude Code's JSONL; in this fork also Codex CLI, Gemini CLI and generic chat JSONL) into efficient and agent-friendly views. Then you will never fear Claude Code's `/compact` - CC now can finally see the original details of compacted context. It also supports searching across all your Claude Code conversations.
 
 Things that tend to happen after you install VCC:
 
@@ -21,7 +21,7 @@ There is also a [paper](https://arxiv.org/abs/2603.29678) showing that VCC impro
 
 # Install
 
-Currently We support Claude Code only. Codex and OpenClaw are coming soon.
+The skills install into Claude Code. The compiler itself (`skills/conversation-compiler/scripts/VCC.py`, Python 3.10+, no dependencies) runs standalone on Claude Code, Codex CLI and Gemini CLI logs, or on any harness's log exported as role/content chat JSONL.
 
 To install, copy this to your Claude Code:
 
@@ -249,6 +249,7 @@ The adaptive view keeps conversation order so it is good for understanding conte
 
 ## Additions in this fork
 
+* **Harness-neutral core**: input adapters for Claude Code, Codex CLI (`rollout-*.jsonl`, also `.jsonl.zst`) and Gemini CLI (`session-*.jsonl` / legacy `.json`), plus a generic role/content chat JSONL adapter for anything else; detected per file (`--harness` to override). Tool calls are understood from argument shapes (path / content / patch arguments), not tool names, and harness noise rules live in per-harness profiles applied once at parse time, so every view and lowering pass is harness-neutral.
 * **Timestamps**: `[user]` headers and every `--grep` hit show the UTC time (`[user] 2026-04-02 10:31Z`).
 * **Search filters**: `--role tool_error`, `--since 2026-04-01`, `--until 2026-04-30`, `--limit 30`. They apply to both the stdout hits and `.view.txt`. `--grep . --role tool_error` lists every failed tool call.
 * **Files view** (`.files.txt`): every file the conversation read or modified, newest first, with `(call, result)` pointers into the full view. `/recall` uses it as the checklist of files to re-read.
